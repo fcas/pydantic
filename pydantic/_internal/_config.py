@@ -1,34 +1,62 @@
 from __future__ import annotations as _annotations
 
 import warnings
+from collections.abc import Callable
 from contextlib import contextmanager
+from re import Pattern
 from typing import (
     TYPE_CHECKING,
     Any,
-    Callable,
+    Literal,
     cast,
 )
 
 from pydantic_core import core_schema
-from typing_extensions import (
-    Literal,
-    Self,
-)
+from typing_extensions import Self
 
 from ..aliases import AliasGenerator
 from ..config import ConfigDict, ExtraValues, JsonDict, JsonEncoder, JsonSchemaExtraCallable
 from ..errors import PydanticUserError
-from ..warnings import PydanticDeprecatedSince20
-
-if not TYPE_CHECKING:
-    # See PyCharm issues https://youtrack.jetbrains.com/issue/PY-21915
-    # and https://youtrack.jetbrains.com/issue/PY-51428
-    DeprecationWarning = PydanticDeprecatedSince20
+from ..warnings import PydanticDeprecatedSince20, PydanticDeprecatedSince210
 
 if TYPE_CHECKING:
     from .._internal._schema_generation_shared import GenerateSchema
+    from ..fields import ComputedFieldInfo, FieldInfo
 
 DEPRECATION_MESSAGE = 'Support for class-based `config` is deprecated, use ConfigDict instead.'
+
+# Maps the `ConfigDict` keys that have a `CoreConfig` counterpart to the corresponding
+# `CoreConfig` key (`'title'` is omitted as it requires special handling, see `ConfigWrapper.core_config()`):
+_config_dict_to_core_config_key: dict[str, str] = {
+    'extra': 'extra_fields_behavior',
+    'allow_inf_nan': 'allow_inf_nan',
+    'str_strip_whitespace': 'str_strip_whitespace',
+    'str_to_lower': 'str_to_lower',
+    'str_to_upper': 'str_to_upper',
+    'strict': 'strict',
+    'ser_json_timedelta': 'ser_json_timedelta',
+    'ser_json_temporal': 'ser_json_temporal',
+    'val_temporal_unit': 'val_temporal_unit',
+    'ser_json_bytes': 'ser_json_bytes',
+    'val_json_bytes': 'val_json_bytes',
+    'ser_json_inf_nan': 'ser_json_inf_nan',
+    'from_attributes': 'from_attributes',
+    'loc_by_alias': 'loc_by_alias',
+    'revalidate_instances': 'revalidate_instances',
+    'validate_default': 'validate_default',
+    'str_max_length': 'str_max_length',
+    'str_min_length': 'str_min_length',
+    'hide_input_in_errors': 'hide_input_in_errors',
+    'coerce_numbers_to_str': 'coerce_numbers_to_str',
+    'regex_engine': 'regex_engine',
+    'validation_error_cause': 'validation_error_cause',
+    'cache_strings': 'cache_strings',
+    'validate_by_alias': 'validate_by_alias',
+    'validate_by_name': 'validate_by_name',
+    'serialize_by_alias': 'serialize_by_alias',
+    'url_preserve_empty_path': 'url_preserve_empty_path',
+    'polymorphic_serialization': 'polymorphic_serialization',
+}
 
 
 class ConfigWrapper:
@@ -57,6 +85,8 @@ class ConfigWrapper:
     # to construct error `loc`s, default `True`
     loc_by_alias: bool
     alias_generator: Callable[[str], str] | AliasGenerator | None
+    model_title_generator: Callable[[type], str] | None
+    field_title_generator: Callable[[str, FieldInfo | ComputedFieldInfo], str] | None
     ignored_types: tuple[type, ...]
     allow_inf_nan: bool
     json_schema_extra: JsonDict | JsonSchemaExtraCallable | None
@@ -67,15 +97,17 @@ class ConfigWrapper:
     # whether instances of models and dataclasses (including subclass instances) should re-validate, default 'never'
     revalidate_instances: Literal['always', 'never', 'subclass-instances']
     ser_json_timedelta: Literal['iso8601', 'float']
-    ser_json_bytes: Literal['utf8', 'base64']
-    ser_json_inf_nan: Literal['null', 'constants']
+    ser_json_temporal: Literal['iso8601', 'seconds', 'milliseconds']
+    val_temporal_unit: Literal['seconds', 'milliseconds', 'infer']
+    ser_json_bytes: Literal['utf8', 'base64', 'hex']
+    val_json_bytes: Literal['utf8', 'base64', 'hex']
+    ser_json_inf_nan: Literal['null', 'constants', 'strings']
     # whether to validate default values during validation, default False
     validate_default: bool
     validate_return: bool
-    protected_namespaces: tuple[str, ...]
+    protected_namespaces: tuple[str | Pattern[str], ...]
     hide_input_in_errors: bool
     defer_build: bool
-    _defer_build_mode: tuple[Literal['model', 'type_adapter'], ...]
     plugin_settings: dict[str, object] | None
     schema_generator: type[GenerateSchema] | None
     json_schema_serialization_defaults_required: bool
@@ -85,6 +117,11 @@ class ConfigWrapper:
     validation_error_cause: bool
     use_attribute_docstrings: bool
     cache_strings: bool | Literal['all', 'keys', 'none']
+    validate_by_alias: bool
+    validate_by_name: bool
+    serialize_by_alias: bool
+    url_preserve_empty_path: bool
+    polymorphic_serialization: bool
 
     def __init__(self, config: ConfigDict | dict[str, Any] | type[Any] | None, *, check: bool = True):
         if check:
@@ -93,7 +130,12 @@ class ConfigWrapper:
             self.config_dict = cast(ConfigDict, config)
 
     @classmethod
-    def for_model(cls, bases: tuple[type[Any], ...], namespace: dict[str, Any], kwargs: dict[str, Any]) -> Self:
+    def for_model(
+        cls,
+        bases: tuple[type[Any], ...],
+        namespace: dict[str, Any],
+        kwargs: dict[str, Any],
+    ) -> Self:
         """Build a new `ConfigWrapper` instance for a `BaseModel`.
 
         The config wrapper built based on (in descending order of priority):
@@ -117,13 +159,6 @@ class ConfigWrapper:
 
         config_class_from_namespace = namespace.get('Config')
         config_dict_from_namespace = namespace.get('model_config')
-
-        raw_annotations = namespace.get('__annotations__', {})
-        if raw_annotations.get('model_config') and not config_dict_from_namespace:
-            raise PydanticUserError(
-                '`model_config` cannot be used as a model field name. Use `model_config` for model configuration.',
-                code='model-config-invalid-field-name',
-            )
 
         if config_class_from_namespace and config_dict_from_namespace:
             raise PydanticUserError('"Config" and "model_config" cannot be used together', code='config-both')
@@ -150,50 +185,57 @@ class ConfigWrapper:
                 except KeyError:
                     raise AttributeError(f'Config has no attribute {name!r}') from None
 
-    def core_config(self, obj: Any) -> core_schema.CoreConfig:
-        """Create a pydantic-core config, `obj` is just used to populate `title` if not set in config.
-
-        Pass `obj=None` if you do not want to attempt to infer the `title`.
+    def core_config(self, title: str | None) -> core_schema.CoreConfig:
+        """Create a pydantic-core config.
 
         We don't use getattr here since we don't want to populate with defaults.
 
         Args:
-            obj: An object used to populate `title` if not set in config.
+            title: The title to use if not set in config.
 
         Returns:
             A `CoreConfig` object created from config.
         """
+        config = self.config_dict
 
-        def dict_not_none(**kwargs: Any) -> Any:
-            return {k: v for k, v in kwargs.items() if v is not None}
+        if not config:
+            # Fast path for the common case of an empty (default) config:
+            return core_schema.CoreConfig(title=title) if title else core_schema.CoreConfig()
 
-        core_config = core_schema.CoreConfig(
-            **dict_not_none(
-                title=self.config_dict.get('title') or (obj and obj.__name__),
-                extra_fields_behavior=self.config_dict.get('extra'),
-                allow_inf_nan=self.config_dict.get('allow_inf_nan'),
-                populate_by_name=self.config_dict.get('populate_by_name'),
-                str_strip_whitespace=self.config_dict.get('str_strip_whitespace'),
-                str_to_lower=self.config_dict.get('str_to_lower'),
-                str_to_upper=self.config_dict.get('str_to_upper'),
-                strict=self.config_dict.get('strict'),
-                ser_json_timedelta=self.config_dict.get('ser_json_timedelta'),
-                ser_json_bytes=self.config_dict.get('ser_json_bytes'),
-                ser_json_inf_nan=self.config_dict.get('ser_json_inf_nan'),
-                from_attributes=self.config_dict.get('from_attributes'),
-                loc_by_alias=self.config_dict.get('loc_by_alias'),
-                revalidate_instances=self.config_dict.get('revalidate_instances'),
-                validate_default=self.config_dict.get('validate_default'),
-                str_max_length=self.config_dict.get('str_max_length'),
-                str_min_length=self.config_dict.get('str_min_length'),
-                hide_input_in_errors=self.config_dict.get('hide_input_in_errors'),
-                coerce_numbers_to_str=self.config_dict.get('coerce_numbers_to_str'),
-                regex_engine=self.config_dict.get('regex_engine'),
-                validation_error_cause=self.config_dict.get('validation_error_cause'),
-                cache_strings=self.config_dict.get('cache_strings'),
+        if config.get('schema_generator') is not None:
+            warnings.warn(
+                'The `schema_generator` setting has been deprecated since v2.10. This setting no longer has any effect.',
+                PydanticDeprecatedSince210,
+                stacklevel=2,
             )
-        )
-        return core_config
+
+        if (populate_by_name := config.get('populate_by_name')) is not None:
+            # We include this patch for backwards compatibility purposes, but this config setting will be deprecated in v3.0, and likely removed in v4.0.
+            # Thus, the above warning and this patch can be removed then as well.
+            if config.get('validate_by_name') is None:
+                config['validate_by_alias'] = True
+                config['validate_by_name'] = populate_by_name
+
+        # We dynamically patch validate_by_name to be True if validate_by_alias is set to False
+        # and validate_by_name is not explicitly set.
+        if config.get('validate_by_alias') is False and config.get('validate_by_name') is None:
+            config['validate_by_name'] = True
+
+        if (not config.get('validate_by_alias', True)) and (not config.get('validate_by_name', False)):
+            raise PydanticUserError(
+                'At least one of `validate_by_alias` or `validate_by_name` must be set to True.',
+                code='validate-by-alias-and-name-false',
+            )
+
+        core_config_values: dict[str, Any] = {}
+        for k, v in config.items():
+            if v is not None and (core_config_key := _config_dict_to_core_config_key.get(k)) is not None:
+                core_config_values[core_config_key] = v
+        title = config.get('title') or title
+        if title:
+            core_config_values['title'] = title
+
+        return cast(core_schema.CoreConfig, core_config_values)
 
     def __repr__(self):
         c = ', '.join(f'{k}={v!r}' for k, v in self.config_dict.items())
@@ -243,23 +285,27 @@ config_defaults = ConfigDict(
     from_attributes=False,
     loc_by_alias=True,
     alias_generator=None,
+    model_title_generator=None,
+    field_title_generator=None,
     ignored_types=(),
     allow_inf_nan=True,
     json_schema_extra=None,
     strict=False,
     revalidate_instances='never',
     ser_json_timedelta='iso8601',
+    ser_json_temporal='iso8601',
+    val_temporal_unit='infer',
     ser_json_bytes='utf8',
+    val_json_bytes='utf8',
     ser_json_inf_nan='null',
     validate_default=False,
     validate_return=False,
-    protected_namespaces=('model_',),
+    protected_namespaces=('model_validate', 'model_dump'),
     hide_input_in_errors=False,
     json_encoders=None,
     defer_build=False,
-    _defer_build_mode=('model',),
-    plugin_settings=None,
     schema_generator=None,
+    plugin_settings=None,
     json_schema_serialization_defaults_required=False,
     json_schema_mode_override=None,
     coerce_numbers_to_str=False,
@@ -267,6 +313,11 @@ config_defaults = ConfigDict(
     validation_error_cause=False,
     use_attribute_docstrings=False,
     cache_strings=True,
+    validate_by_alias=True,
+    validate_by_name=False,
+    serialize_by_alias=False,
+    url_preserve_empty_path=False,
+    polymorphic_serialization=False,
 )
 
 
@@ -283,7 +334,7 @@ def prepare_config(config: ConfigDict | dict[str, Any] | type[Any] | None) -> Co
         return ConfigDict()
 
     if not isinstance(config, dict):
-        warnings.warn(DEPRECATION_MESSAGE, DeprecationWarning)
+        warnings.warn(DEPRECATION_MESSAGE, PydanticDeprecatedSince20, stacklevel=4)
         config = {k: getattr(config, k) for k in dir(config) if not k.startswith('__')}
 
     config_dict = cast(ConfigDict, config)
@@ -307,7 +358,7 @@ V2_REMOVED_KEYS = {
     'post_init_call',
 }
 V2_RENAMED_KEYS = {
-    'allow_population_by_field_name': 'populate_by_name',
+    'allow_population_by_field_name': 'validate_by_name',
     'anystr_lower': 'str_to_lower',
     'anystr_strip_whitespace': 'str_strip_whitespace',
     'anystr_upper': 'str_to_upper',

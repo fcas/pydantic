@@ -1,20 +1,37 @@
 import re
+from typing import Final
 
 import pytest
+from typing_extensions import NotRequired, Required
 
-from pydantic import BaseModel, PydanticUserError, ValidationError
+from pydantic import BaseModel, PydanticForbiddenQualifier, PydanticUserError, ValidationError
 from pydantic.version import version_short
 
 
 def test_user_error_url():
-    with pytest.raises(PydanticUserError) as exc_info:
+    with pytest.raises(
+        PydanticUserError,
+        check=lambda e: (
+            str(e)
+            == (
+                'Pydantic models should inherit from BaseModel, BaseModel cannot be instantiated directly\n\n'
+                f'For further information visit https://errors.pydantic.dev/{version_short()}/u/base-model-instantiated'
+            )
+        ),
+    ):
         BaseModel()
 
-    # insert_assert(str(exc_info.value))
-    assert str(exc_info.value) == (
-        'Pydantic models should inherit from BaseModel, BaseModel cannot be instantiated directly\n\n'
-        f'For further information visit https://errors.pydantic.dev/{version_short()}/u/base-model-instantiated'
-    )
+
+def test_forbidden_qualifier() -> None:
+    with pytest.raises(PydanticForbiddenQualifier):
+
+        class Model1(BaseModel):
+            a: Required[int]
+
+    with pytest.raises(PydanticForbiddenQualifier):
+
+        class Model2(BaseModel):
+            b: Final[NotRequired[str]] = 'test'
 
 
 @pytest.mark.parametrize(

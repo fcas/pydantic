@@ -1,19 +1,25 @@
 import contextlib
 import re
-import sys
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date, datetime
 from enum import Enum
 from functools import partial, partialmethod
 from itertools import product
-from typing import Any, Callable, Deque, Dict, FrozenSet, List, NamedTuple, Optional, Tuple, Union
+from os.path import normcase
+from typing import (
+    Annotated,
+    Any,
+    Literal,
+    NamedTuple,
+)
 from unittest.mock import MagicMock
 
 import pytest
 from dirty_equals import HasRepr, IsInstance
 from pydantic_core import core_schema
-from typing_extensions import Annotated, Literal, TypedDict
+from typing_extensions import TypeAliasType, TypedDict
 
 from pydantic import (
     BaseModel,
@@ -36,6 +42,7 @@ from pydantic import (
 )
 from pydantic.dataclasses import dataclass as pydantic_dataclass
 from pydantic.functional_validators import AfterValidator, BeforeValidator, PlainValidator, WrapValidator
+from pydantic.version import version_short
 
 V1_VALIDATOR_DEPRECATION_MATCH = r'Pydantic V1 style `@validator` validators are deprecated'
 
@@ -64,7 +71,6 @@ def test_annotated_validator_before() -> None:
     assert Model(x='1.0').x == 1.0
 
 
-@pytest.mark.xfail(sys.version_info >= (3, 9) and sys.implementation.name == 'pypy', reason='PyPy 3.9+ bug')
 def test_annotated_validator_builtin() -> None:
     """https://github.com/pydantic/pydantic/issues/6752"""
     TruncatedFloat = Annotated[float, BeforeValidator(int)]
@@ -124,13 +130,13 @@ def test_annotated_validator_wrap() -> None:
 def test_annotated_validator_nested() -> None:
     MyInt = Annotated[int, AfterValidator(lambda x: x if x != -1 else 0)]
 
-    def non_decreasing_list(data: List[int]) -> List[int]:
+    def non_decreasing_list(data: list[int]) -> list[int]:
         for prev, cur in zip(data, data[1:]):
             assert cur >= prev
         return data
 
     class Model(BaseModel):
-        x: Annotated[List[MyInt], AfterValidator(non_decreasing_list)]
+        x: Annotated[list[MyInt], AfterValidator(non_decreasing_list)]
 
     assert Model(x=[0, -1, 2]).x == [0, 0, 2]
 
@@ -175,7 +181,7 @@ def test_annotated_validator_typing_cache(validator, func):
     FancyInt = Annotated[int, validator(func)]
 
     class FancyIntModel(BaseModel):
-        x: Optional[FancyInt]
+        x: FancyInt | None
 
     assert FancyIntModel(x=1234).x == 1234
     assert FancyIntModel(x=-1).x == 0
@@ -240,7 +246,7 @@ def test_int_validation():
     assert Model(a=(2**63) + 100).a == (2**63) + 100
 
 
-@pytest.mark.parametrize('value', [2.2250738585072011e308, float('nan'), float('inf')])
+@pytest.mark.parametrize('value', [float('nan'), float('inf')])
 def test_int_overflow_validation(value):
     class Model(BaseModel):
         a: int
@@ -254,7 +260,7 @@ def test_int_overflow_validation(value):
 
 def test_frozenset_validation():
     class Model(BaseModel):
-        a: FrozenSet[int]
+        a: frozenset[int]
 
     with pytest.raises(ValidationError) as exc_info:
         Model(a='snap')
@@ -270,7 +276,7 @@ def test_frozenset_validation():
 
 def test_deque_validation():
     class Model(BaseModel):
-        a: Deque[int]
+        a: deque[int]
 
     with pytest.raises(ValidationError) as exc_info:
         Model(a='snap')
@@ -305,17 +311,17 @@ def test_deque_validation():
 
 def test_validate_whole():
     class Model(BaseModel):
-        a: List[int]
+        a: list[int]
 
         @field_validator('a', mode='before')
         @classmethod
-        def check_a1(cls, v: List[Any]) -> List[Any]:
+        def check_a1(cls, v: list[Any]) -> list[Any]:
             v.append('123')
             return v
 
         @field_validator('a')
         @classmethod
-        def check_a2(cls, v: List[int]) -> List[Any]:
+        def check_a2(cls, v: list[int]) -> list[Any]:
             v.append(456)
             return v
 
@@ -326,7 +332,7 @@ def test_validate_pre_error():
     calls = []
 
     class Model(BaseModel):
-        a: List[int]
+        a: list[int]
 
         @field_validator('a', mode='before')
         @classmethod
@@ -527,7 +533,7 @@ def test_classmethod():
 
 
 def test_use_bare():
-    with pytest.raises(TypeError, match='`@validator` should be used with fields'):
+    with pytest.raises(PydanticUserError, check=lambda e: e.code == 'decorator-missing-arguments'):
 
         class Model(BaseModel):
             a: str
@@ -540,7 +546,7 @@ def test_use_bare():
 
 
 def test_use_bare_field_validator():
-    with pytest.raises(TypeError, match='`@field_validator` should be used with fields'):
+    with pytest.raises(PydanticUserError, check=lambda e: e.code == 'decorator-missing-arguments'):
 
         class Model(BaseModel):
             a: str
@@ -573,11 +579,7 @@ def test_use_no_fields_field_validator():
 
 
 def test_validator_bad_fields_throws_configerror():
-    """
-    Attempts to create a validator with fields set as a list of strings,
-    rather than just multiple string args. Expects ConfigError to be raised.
-    """
-    with pytest.raises(TypeError, match='`@validator` fields should be passed as separate string args.'):
+    with pytest.raises(PydanticUserError, check=lambda e: e.code == 'decorator-invalid-fields'):
 
         class Model(BaseModel):
             a: str
@@ -591,17 +593,24 @@ def test_validator_bad_fields_throws_configerror():
 
 
 def test_field_validator_bad_fields_throws_configerror():
-    """
-    Attempts to create a validator with fields set as a list of strings,
-    rather than just multiple string args. Expects ConfigError to be raised.
-    """
-    with pytest.raises(TypeError, match='`@field_validator` fields should be passed as separate string args.'):
+    with pytest.raises(PydanticUserError, check=lambda e: e.code == 'decorator-invalid-fields'):
 
-        class Model(BaseModel):
+        class Model1(BaseModel):
             a: str
             b: str
 
             @field_validator(['a', 'b'])
+            def check_fields(cls, v):
+                return v
+
+    with pytest.raises(PydanticUserError, check=lambda e: e.code == 'decorator-invalid-fields'):
+
+        class Model2(BaseModel):
+            a: str
+            b: str
+
+            @field_validator(['a', 'b'])
+            @classmethod
             def check_fields(cls, v):
                 return v
 
@@ -692,7 +701,7 @@ def test_validate_not_always():
     check_calls = 0
 
     class Model(BaseModel):
-        a: Optional[str] = None
+        a: str | None = None
 
         @field_validator('a', mode='before')
         @classmethod
@@ -710,7 +719,11 @@ def test_validate_not_always():
 @pytest.mark.parametrize(
     'decorator, pytest_warns',
     [
-        (validator, pytest.warns(PydanticDeprecatedSince20, match=V1_VALIDATOR_DEPRECATION_MATCH)),
+        pytest.param(
+            validator,
+            pytest.warns(PydanticDeprecatedSince20, match=V1_VALIDATOR_DEPRECATION_MATCH),
+            marks=pytest.mark.thread_unsafe(reason='`pytest.warns()` is thread unsafe'),
+        ),
         (field_validator, contextlib.nullcontext()),
     ],
 )
@@ -751,7 +764,11 @@ def test_wildcard_validators(decorator, pytest_warns):
 @pytest.mark.parametrize(
     'decorator, pytest_warns',
     [
-        (validator, pytest.warns(PydanticDeprecatedSince20, match=V1_VALIDATOR_DEPRECATION_MATCH)),
+        pytest.param(
+            validator,
+            pytest.warns(PydanticDeprecatedSince20, match=V1_VALIDATOR_DEPRECATION_MATCH),
+            marks=pytest.mark.thread_unsafe(reason='`pytest.warns()` is thread unsafe'),
+        ),
         (field_validator, contextlib.nullcontext()),
     ],
 )
@@ -978,42 +995,42 @@ def test_inheritance_replace():
     """
 
     class Parent(BaseModel):
-        a: List[str]
+        a: list[str]
 
         @field_validator('a')
         @classmethod
-        def parent_val_before(cls, v: List[str]):
+        def parent_val_before(cls, v: list[str]):
             v.append('parent before')
             return v
 
         @field_validator('a')
         @classmethod
-        def val(cls, v: List[str]):
+        def val(cls, v: list[str]):
             v.append('parent')
             return v
 
         @field_validator('a')
         @classmethod
-        def parent_val_after(cls, v: List[str]):
+        def parent_val_after(cls, v: list[str]):
             v.append('parent after')
             return v
 
     class Child(Parent):
         @field_validator('a')
         @classmethod
-        def child_val_before(cls, v: List[str]):
+        def child_val_before(cls, v: list[str]):
             v.append('child before')
             return v
 
         @field_validator('a')
         @classmethod
-        def val(cls, v: List[str]):
+        def val(cls, v: list[str]):
             v.append('child')
             return v
 
         @field_validator('a')
         @classmethod
-        def child_val_after(cls, v: List[str]):
+        def child_val_after(cls, v: list[str]):
             v.append('child after')
             return v
 
@@ -1031,36 +1048,36 @@ def test_inheritance_replace_root_validator():
     with pytest.warns(PydanticDeprecatedSince20):
 
         class Parent(BaseModel):
-            a: List[str]
+            a: list[str]
 
             @root_validator(skip_on_failure=True)
-            def parent_val_before(cls, values: Dict[str, Any]):
+            def parent_val_before(cls, values: dict[str, Any]):
                 values['a'].append('parent before')
                 return values
 
             @root_validator(skip_on_failure=True)
-            def val(cls, values: Dict[str, Any]):
+            def val(cls, values: dict[str, Any]):
                 values['a'].append('parent')
                 return values
 
             @root_validator(skip_on_failure=True)
-            def parent_val_after(cls, values: Dict[str, Any]):
+            def parent_val_after(cls, values: dict[str, Any]):
                 values['a'].append('parent after')
                 return values
 
         class Child(Parent):
             @root_validator(skip_on_failure=True)
-            def child_val_before(cls, values: Dict[str, Any]):
+            def child_val_before(cls, values: dict[str, Any]):
                 values['a'].append('child before')
                 return values
 
             @root_validator(skip_on_failure=True)
-            def val(cls, values: Dict[str, Any]):
+            def val(cls, values: dict[str, Any]):
                 values['a'].append('child')
                 return values
 
             @root_validator(skip_on_failure=True)
-            def child_val_after(cls, values: Dict[str, Any]):
+            def child_val_after(cls, values: dict[str, Any]):
                 values['a'].append('child after')
                 return values
 
@@ -1072,7 +1089,7 @@ def test_validation_each_item():
     with pytest.warns(PydanticDeprecatedSince20, match=V1_VALIDATOR_DEPRECATION_MATCH):
 
         class Model(BaseModel):
-            foobar: Dict[int, int]
+            foobar: dict[int, int]
 
             @validator('foobar', each_item=True)
             @classmethod
@@ -1080,6 +1097,20 @@ def test_validation_each_item():
                 return v + 1
 
     assert Model(foobar={1: 1}).foobar == {1: 2}
+
+
+def test_validation_each_item_tuple():
+    with pytest.warns(PydanticDeprecatedSince20, match=V1_VALIDATOR_DEPRECATION_MATCH):
+
+        class Model(BaseModel):
+            foobar: tuple[int, ...]
+
+            @validator('foobar', each_item=True)
+            @classmethod
+            def check_foobar(cls, v: Any):
+                return v + 1
+
+    assert Model(foobar=(1, 2, 1)).foobar == (2, 3, 2)
 
 
 def test_validation_each_item_invalid_type():
@@ -1093,15 +1124,14 @@ def test_validation_each_item_invalid_type():
 
                 @validator('foobar', each_item=True)
                 @classmethod
-                def check_foobar(cls, v: Any):
-                    ...
+                def check_foobar(cls, v: Any): ...
 
 
 def test_validation_each_item_nullable():
     with pytest.warns(PydanticDeprecatedSince20, match=V1_VALIDATOR_DEPRECATION_MATCH):
 
         class Model(BaseModel):
-            foobar: Optional[List[int]]
+            foobar: list[int] | None
 
             @validator('foobar', each_item=True)
             @classmethod
@@ -1115,11 +1145,11 @@ def test_validation_each_item_one_sublevel():
     with pytest.warns(PydanticDeprecatedSince20, match=V1_VALIDATOR_DEPRECATION_MATCH):
 
         class Model(BaseModel):
-            foobar: List[Tuple[int, int]]
+            foobar: list[tuple[int, int]]
 
             @validator('foobar', each_item=True)
             @classmethod
-            def check_foobar(cls, v: Tuple[int, int]) -> Tuple[int, int]:
+            def check_foobar(cls, v: tuple[int, int]) -> tuple[int, int]:
                 v1, v2 = v
                 assert v1 == v2
                 return v
@@ -1129,7 +1159,7 @@ def test_validation_each_item_one_sublevel():
 
 def test_key_validation():
     class Model(BaseModel):
-        foobar: Dict[int, int]
+        foobar: dict[int, int]
 
         @field_validator('foobar')
         @classmethod
@@ -1143,7 +1173,7 @@ def test_validator_always_optional():
     check_calls = 0
 
     class Model(BaseModel):
-        a: Optional[str] = None
+        a: str | None = None
 
         with pytest.warns(PydanticDeprecatedSince20, match=V1_VALIDATOR_DEPRECATION_MATCH):
 
@@ -1164,7 +1194,7 @@ def test_field_validator_validate_default_optional():
     check_calls = 0
 
     class Model(BaseModel):
-        a: Optional[str] = Field(None, validate_default=True)
+        a: str | None = Field(None, validate_default=True)
 
         @field_validator('a', mode='before')
         @classmethod
@@ -1250,7 +1280,7 @@ def test_field_validator_validate_default_post():
 
 def test_validator_always_post_optional():
     class Model(BaseModel):
-        a: Optional[str] = None
+        a: str | None = None
 
         with pytest.warns(PydanticDeprecatedSince20, match=V1_VALIDATOR_DEPRECATION_MATCH):
 
@@ -1265,7 +1295,7 @@ def test_validator_always_post_optional():
 
 def test_field_validator_validate_default_post_optional():
     class Model(BaseModel):
-        a: Optional[str] = Field(None, validate_default=True)
+        a: str | None = Field(None, validate_default=True)
 
         @field_validator('a', mode='before')
         @classmethod
@@ -1324,7 +1354,7 @@ def test_pre_called_once():
     check_calls = 0
 
     class Model(BaseModel):
-        a: Tuple[int, int, int]
+        a: tuple[int, int, int]
 
         @field_validator('a', mode='before')
         @classmethod
@@ -1364,7 +1394,7 @@ def test_assert_raises_validation_error():
 
 
 def test_root_validator():
-    root_val_values: List[Dict[str, Any]] = []
+    root_val_values: list[dict[str, Any]] = []
 
     class Model(BaseModel):
         a: int = 1
@@ -1379,14 +1409,14 @@ def test_root_validator():
         with pytest.warns(PydanticDeprecatedSince20):
 
             @root_validator(skip_on_failure=True)
-            def example_root_validator(cls, values: Dict[str, Any]) -> Dict[str, Any]:
+            def example_root_validator(cls, values: dict[str, Any]) -> dict[str, Any]:
                 root_val_values.append(values)
                 if 'snap' in values.get('b', ''):
                     raise ValueError('foobar')
                 return dict(values, b='changed')
 
             @root_validator(skip_on_failure=True)
-            def example_root_validator2(cls, values: Dict[str, Any]) -> Dict[str, Any]:
+            def example_root_validator2(cls, values: dict[str, Any]) -> dict[str, Any]:
                 root_val_values.append(values)
                 if 'snap' in values.get('c', ''):
                     raise ValueError('foobar2')
@@ -1436,7 +1466,7 @@ def test_root_validator_subclass():
 
             @root_validator(skip_on_failure=True)
             @classmethod
-            def root_val(cls, values: Dict[str, Any]) -> Dict[str, Any]:
+            def root_val(cls, values: dict[str, Any]) -> dict[str, Any]:
                 assert cls is values['expected']
                 return values
 
@@ -1448,14 +1478,14 @@ def test_root_validator_subclass():
 
             @root_validator(skip_on_failure=True)
             @classmethod
-            def root_val(cls, values: Dict[str, Any]) -> Dict[str, Any]:
+            def root_val(cls, values: dict[str, Any]) -> dict[str, Any]:
                 assert cls is Child2
                 values['x'] = values['x'] * 2
                 return values
 
     class Child3(Parent):
         @classmethod
-        def root_val(cls, values: Dict[str, Any]) -> Dict[str, Any]:
+        def root_val(cls, values: dict[str, Any]) -> dict[str, Any]:
             assert cls is Child3
             values['x'] = values['x'] * 3
             return values
@@ -1467,7 +1497,7 @@ def test_root_validator_subclass():
 
 
 def test_root_validator_pre():
-    root_val_values: List[Dict[str, Any]] = []
+    root_val_values: list[dict[str, Any]] = []
 
     class Model(BaseModel):
         a: int = 1
@@ -1481,7 +1511,7 @@ def test_root_validator_pre():
         with pytest.warns(PydanticDeprecatedSince20):
 
             @root_validator(pre=True)
-            def root_validator(cls, values: Dict[str, Any]) -> Dict[str, Any]:
+            def root_validator(cls, values: dict[str, Any]) -> dict[str, Any]:
                 root_val_values.append(values)
                 if 'snap' in values.get('b', ''):
                     raise ValueError('foobar')
@@ -1514,7 +1544,7 @@ def test_root_validator_types():
         with pytest.warns(PydanticDeprecatedSince20):
 
             @root_validator(skip_on_failure=True)
-            def root_validator(cls, values: Dict[str, Any]) -> Dict[str, Any]:
+            def root_validator(cls, values: dict[str, Any]) -> dict[str, Any]:
                 nonlocal root_val_values
                 root_val_values = cls, repr(values)
                 return values
@@ -1544,8 +1574,6 @@ def test_root_validator_returns_none_exception():
 
 
 def test_model_validator_returns_ignore():
-    # This is weird, and I don't understand entirely why it's happening, but it kind of makes sense
-
     class Model(BaseModel):
         a: int = 1
 
@@ -1553,7 +1581,8 @@ def test_model_validator_returns_ignore():
         def model_validator_return_none(self) -> None:
             return None
 
-    m = Model(a=2)
+    with pytest.warns(UserWarning, match='A custom validator is returning a value other than `self`'):
+        m = Model(a=2)
     assert m.model_dump() == {'a': 2}
 
 
@@ -1572,7 +1601,7 @@ def test_reuse_global_validators():
     assert dict(Model(x=1, y=1)) == {'x': 2, 'y': 2}
 
 
-@pytest.mark.parametrize('validator_classmethod,root_validator_classmethod', product(*[[True, False]] * 2))
+@pytest.mark.parametrize('validator_classmethod,root_validator_classmethod', list(product(*[[True, False]] * 2)))
 def test_root_validator_classmethod(validator_classmethod, root_validator_classmethod):
     root_val_values = []
 
@@ -1712,7 +1741,7 @@ def test_nested_literal_validator():
 
 def test_union_literal_with_constraints():
     class Model(BaseModel, validate_assignment=True):
-        x: Union[Literal[42], Literal['pika']] = Field(frozen=True)
+        x: Literal[42] | Literal['pika'] = Field(frozen=True)
 
     m = Model(x=42)
     with pytest.raises(ValidationError) as exc_info:
@@ -1787,7 +1816,7 @@ def test_overridden_root_validators():
 
         @model_validator(mode='before')
         @classmethod
-        def pre_root(cls, values: Dict[str, Any]) -> Dict[str, Any]:
+        def pre_root(cls, values: dict[str, Any]) -> dict[str, Any]:
             validate_stub('A', 'pre')
             return values
 
@@ -1799,7 +1828,7 @@ def test_overridden_root_validators():
     class B(A):
         @model_validator(mode='before')
         @classmethod
-        def pre_root(cls, values: Dict[str, Any]) -> Dict[str, Any]:
+        def pre_root(cls, values: dict[str, Any]) -> dict[str, Any]:
             validate_stub('B', 'pre')
             return values
 
@@ -1819,14 +1848,14 @@ def test_overridden_root_validators():
 
 def test_validating_assignment_pre_root_validator_fail():
     class Model(BaseModel):
-        current_value: float = Field(..., alias='current')
+        current_value: float = Field(alias='current')
         max_value: float
 
         model_config = ConfigDict(validate_assignment=True)
         with pytest.warns(PydanticDeprecatedSince20):
 
             @root_validator(pre=True)
-            def values_are_not_string(cls, values: Dict[str, Any]) -> Dict[str, Any]:
+            def values_are_not_string(cls, values: dict[str, Any]) -> dict[str, Any]:
                 if any(isinstance(x, str) for x in values.values()):
                     raise ValueError('values cannot be a string')
                 return values
@@ -1847,14 +1876,14 @@ def test_validating_assignment_pre_root_validator_fail():
 
 def test_validating_assignment_model_validator_before_fail():
     class Model(BaseModel):
-        current_value: float = Field(..., alias='current')
+        current_value: float = Field(alias='current')
         max_value: float
 
         model_config = ConfigDict(validate_assignment=True)
 
         @model_validator(mode='before')
         @classmethod
-        def values_are_not_string(cls, values: Dict[str, Any]) -> Dict[str, Any]:
+        def values_are_not_string(cls, values: dict[str, Any]) -> dict[str, Any]:
             assert isinstance(values, dict)
             if any(isinstance(x, str) for x in values.values()):
                 raise ValueError('values cannot be a string')
@@ -1882,15 +1911,15 @@ def test_validating_assignment_model_validator_before_fail():
         {'pre': False},
     ],
 )
-def test_root_validator_skip_on_failure_invalid(kwargs: Dict[str, Any]):
-    with pytest.raises(TypeError, match='MUST specify `skip_on_failure=True`'):
+def test_root_validator_skip_on_failure_invalid(kwargs: dict[str, Any]):
+    with pytest.raises(PydanticUserError, match='MUST specify `skip_on_failure=True`'):
         with pytest.warns(
             PydanticDeprecatedSince20, match='Pydantic V1 style `@root_validator` validators are deprecated.'
         ):
 
             class Model(BaseModel):
                 @root_validator(**kwargs)
-                def root_val(cls, values: Dict[str, Any]) -> Dict[str, Any]:
+                def root_val(cls, values: dict[str, Any]) -> dict[str, Any]:
                     return values
 
 
@@ -1903,14 +1932,14 @@ def test_root_validator_skip_on_failure_invalid(kwargs: Dict[str, Any]):
         {'pre': True},
     ],
 )
-def test_root_validator_skip_on_failure_valid(kwargs: Dict[str, Any]):
+def test_root_validator_skip_on_failure_valid(kwargs: dict[str, Any]):
     with pytest.warns(
         PydanticDeprecatedSince20, match='Pydantic V1 style `@root_validator` validators are deprecated.'
     ):
 
         class Model(BaseModel):
             @root_validator(**kwargs)
-            def root_val(cls, values: Dict[str, Any]) -> Dict[str, Any]:
+            def root_val(cls, values: dict[str, Any]) -> dict[str, Any]:
                 return values
 
 
@@ -1920,7 +1949,7 @@ def test_model_validator_many_values_change():
     class Rectangle(BaseModel):
         width: float
         height: float
-        area: Optional[float] = None
+        area: float | None = None
 
         model_config = ConfigDict(validate_assignment=True)
 
@@ -1951,7 +1980,7 @@ def test_v1_validator_deprecated():
 
             @validator('x')
             @classmethod
-            def check_x(cls, x: int, values: Dict[str, Any]) -> int:
+            def check_x(cls, x: int, values: dict[str, Any]) -> int:
                 assert x * 2 == values['y']
                 return x
 
@@ -1963,7 +1992,7 @@ def test_v1_validator_deprecated():
     # check that we got stacklevel correct
     # if this fails you need to edit the stacklevel
     # parameter to warnings.warn in _decorators.py
-    assert w.filename == __file__
+    assert normcase(w.filename) == normcase(__file__)
     source = _get_source_line(w.filename, w.lineno)
     assert "@validator('x')" in source
 
@@ -2033,7 +2062,7 @@ def test_root_validator_self():
 
 def test_validator_self():
     with pytest.warns(PydanticDeprecatedSince20, match=V1_VALIDATOR_DEPRECATION_MATCH):
-        with pytest.raises(TypeError, match=r'`@validator` cannot be applied to instance methods'):
+        with pytest.raises(PydanticUserError, match=r'`@validator` cannot be applied to instance methods'):
 
             class Model(BaseModel):
                 a: int = 1
@@ -2044,7 +2073,7 @@ def test_validator_self():
 
 
 def test_field_validator_self():
-    with pytest.raises(TypeError, match=r'`@field_validator` cannot be applied to instance methods'):
+    with pytest.raises(PydanticUserError, check=lambda e: e.code == 'validator-instance-method'):
 
         class Model(BaseModel):
             a: int = 1
@@ -2056,14 +2085,13 @@ def test_field_validator_self():
 
 def test_v1_validator_signature_kwargs_not_allowed() -> None:
     with pytest.warns(PydanticDeprecatedSince20, match=V1_VALIDATOR_DEPRECATION_MATCH):
-        with pytest.raises(TypeError, match=r'Unsupported signature for V1 style validator'):
+        with pytest.raises(PydanticUserError, match=r'Unsupported signature for V1 style validator'):
 
             class Model(BaseModel):
                 a: int
 
                 @validator('a')
-                def check_a(cls, value: Any, foo: Any) -> Any:
-                    ...
+                def check_a(cls, value: Any, foo: Any) -> Any: ...
 
 
 def test_v1_validator_signature_kwargs1() -> None:
@@ -2090,7 +2118,7 @@ def test_v1_validator_signature_kwargs2() -> None:
             b: int
 
             @validator('b')
-            def check_b(cls, value: Any, values: Dict[str, Any], **kwargs: Any) -> Any:
+            def check_b(cls, value: Any, values: dict[str, Any], **kwargs: Any) -> Any:
                 assert kwargs == {}
                 assert values == {'a': 1}
                 assert value == 2
@@ -2107,7 +2135,7 @@ def test_v1_validator_signature_with_values() -> None:
             b: int
 
             @validator('b')
-            def check_b(cls, value: Any, values: Dict[str, Any]) -> Any:
+            def check_b(cls, value: Any, values: dict[str, Any]) -> Any:
                 assert values == {'a': 1}
                 assert value == 2
                 return value + 1
@@ -2123,7 +2151,7 @@ def test_v1_validator_signature_with_values_kw_only() -> None:
             b: int
 
             @validator('b')
-            def check_b(cls, value: Any, *, values: Dict[str, Any]) -> Any:
+            def check_b(cls, value: Any, *, values: dict[str, Any]) -> Any:
                 assert values == {'a': 1}
                 assert value == 2
                 return value + 1
@@ -2133,28 +2161,30 @@ def test_v1_validator_signature_with_values_kw_only() -> None:
 
 def test_v1_validator_signature_with_field() -> None:
     with pytest.warns(PydanticDeprecatedSince20, match=V1_VALIDATOR_DEPRECATION_MATCH):
-        with pytest.raises(TypeError, match=r'The `field` and `config` parameters are not available in Pydantic V2'):
+        with pytest.raises(
+            PydanticUserError, match=r'The `field` and `config` parameters are not available in Pydantic V2'
+        ):
 
             class Model(BaseModel):
                 a: int
                 b: int
 
                 @validator('b')
-                def check_b(cls, value: Any, field: Any) -> Any:
-                    ...
+                def check_b(cls, value: Any, field: Any) -> Any: ...
 
 
 def test_v1_validator_signature_with_config() -> None:
     with pytest.warns(PydanticDeprecatedSince20, match=V1_VALIDATOR_DEPRECATION_MATCH):
-        with pytest.raises(TypeError, match=r'The `field` and `config` parameters are not available in Pydantic V2'):
+        with pytest.raises(
+            PydanticUserError, match=r'The `field` and `config` parameters are not available in Pydantic V2'
+        ):
 
             class Model(BaseModel):
                 a: int
                 b: int
 
                 @validator('b')
-                def check_b(cls, value: Any, config: Any) -> Any:
-                    ...
+                def check_b(cls, value: Any, config: Any) -> Any: ...
 
 
 def test_model_config_validate_default():
@@ -2204,7 +2234,7 @@ def partial_val_func2(
 
 def partial_values_val_func1(
     value: int,
-    values: Dict[str, Any],
+    values: dict[str, Any],
     *,
     allowed: int,
 ) -> int:
@@ -2216,7 +2246,7 @@ def partial_values_val_func1(
 def partial_values_val_func2(
     value: int,
     *,
-    values: Dict[str, Any],
+    values: dict[str, Any],
     allowed: int,
 ) -> int:
     assert isinstance(values, dict)
@@ -2261,7 +2291,7 @@ def partial_cls_val_func2(
 def partial_cls_values_val_func1(
     cls: Any,
     value: int,
-    values: Dict[str, Any],
+    values: dict[str, Any],
     *,
     allowed: int,
     expected_cls: Any,
@@ -2276,7 +2306,7 @@ def partial_cls_values_val_func2(
     cls: Any,
     value: int,
     *,
-    values: Dict[str, Any],
+    values: dict[str, Any],
     allowed: int,
     expected_cls: Any,
 ) -> int:
@@ -2535,7 +2565,7 @@ def test_validator_allow_reuse_different_field_3():
             y: int
 
             val_x = field_validator('x')(val1)
-            val_x = field_validator('y')(val2)
+            val_x = field_validator('y')(val2)  # noqa: PIE794
 
     assert Model(x=1, y=2).model_dump() == {'x': 1, 'y': 4}
 
@@ -2554,6 +2584,9 @@ def test_validator_allow_reuse_different_field_4():
     assert Model(x=1, y=2).model_dump() == {'x': 2, 'y': 3}
 
 
+@pytest.mark.filterwarnings(
+    'ignore:Pydantic V1 style `@root_validator` validators are deprecated.*:pydantic.warnings.PydanticDeprecatedSince20'
+)
 def test_root_validator_allow_reuse_same_field():
     with pytest.warns(UserWarning, match='`root_val` overrides an existing Pydantic `@root_validator` decorator'):
 
@@ -2561,12 +2594,12 @@ def test_root_validator_allow_reuse_same_field():
             x: int
 
             @root_validator(skip_on_failure=True)
-            def root_val(cls, v: Dict[str, Any]) -> Dict[str, Any]:
+            def root_val(cls, v: dict[str, Any]) -> dict[str, Any]:
                 v['x'] += 1
                 return v
 
             @root_validator(skip_on_failure=True)
-            def root_val(cls, v: Dict[str, Any]) -> Dict[str, Any]:
+            def root_val(cls, v: dict[str, Any]) -> dict[str, Any]:
                 v['x'] += 2
                 return v
 
@@ -2580,7 +2613,7 @@ def test_root_validator_allow_reuse_inheritance():
             x: int
 
             @root_validator(skip_on_failure=True)
-            def root_val(cls, v: Dict[str, Any]) -> Dict[str, Any]:
+            def root_val(cls, v: dict[str, Any]) -> dict[str, Any]:
                 v['x'] += 1
                 return v
 
@@ -2588,7 +2621,7 @@ def test_root_validator_allow_reuse_inheritance():
 
         class Child(Parent):
             @root_validator(skip_on_failure=True)
-            def root_val(cls, v: Dict[str, Any]) -> Dict[str, Any]:
+            def root_val(cls, v: dict[str, Any]) -> dict[str, Any]:
                 assert v == {'x': 1}
                 v = super().root_val(v)
                 assert v == {'x': 2}
@@ -2671,7 +2704,7 @@ def foobar_validate(value: Any, info: core_schema.ValidationInfo):
 class Foobar:
     @classmethod
     def __get_pydantic_core_schema__(cls, source_type: Any, handler: GetCoreSchemaHandler) -> core_schema.CoreSchema:
-        return core_schema.with_info_plain_validator_function(foobar_validate, field_name=handler.field_name)
+        return core_schema.with_info_plain_validator_function(foobar_validate)
 
 
 def test_custom_type_field_name_model():
@@ -2686,7 +2719,7 @@ def test_custom_type_field_name_model():
 def test_custom_type_field_name_model_nested():
     class MyModel(BaseModel):
         x: int
-        tuple_nested: Tuple[int, Foobar]
+        tuple_nested: tuple[int, Foobar]
 
     m = MyModel(x='123', tuple_nested=(1, 2))
     # insert_assert(m.tuple_nested[1])
@@ -2749,7 +2782,7 @@ def test_after_validator_field_name():
 def test_before_validator_field_name():
     class MyModel(BaseModel):
         x: int
-        foobar: Annotated[Dict[Any, Any], BeforeValidator(foobar_validate)]
+        foobar: Annotated[dict[Any, Any], BeforeValidator(foobar_validate)]
 
     m = MyModel(x='123', foobar='1')
     # insert_assert(m.foobar)
@@ -2764,6 +2797,29 @@ def test_plain_validator_field_name():
     m = MyModel(x='123', foobar='1')
     # insert_assert(m.foobar)
     assert m.foobar == {'value': '1', 'field_name': 'foobar', 'data': {'x': 123}}
+
+
+def test_validator_field_name_with_reused_type_alias():
+    calls = []
+
+    def validate_my_field(value: str, info: ValidationInfo):
+        calls.append((info.field_name, value))
+        return value
+
+    MyField = TypeAliasType('MyField', Annotated[str, AfterValidator(validate_my_field)])
+
+    class MyModel(BaseModel):
+        field1: MyField
+        field2: MyField
+
+    MyModel.model_validate(
+        {
+            'field1': 'value1',
+            'field2': 'value2',
+        }
+    )
+
+    assert calls == [('field1', 'value1'), ('field2', 'value2')]
 
 
 def validate_wrap(value: Any, handler: core_schema.ValidatorFunctionWrapHandler, info: core_schema.ValidationInfo):
@@ -2786,8 +2842,8 @@ def test_wrap_validator_field_name():
 def test_validate_default_raises_for_basemodel() -> None:
     class Model(BaseModel):
         value_0: str
-        value_a: Annotated[Optional[str], Field(None, validate_default=True)]
-        value_b: Annotated[Optional[str], Field(None, validate_default=True)]
+        value_a: Annotated[str | None, Field(None, validate_default=True)]
+        value_b: Annotated[str | None, Field(None, validate_default=True)]
 
         @field_validator('value_a', mode='after')
         def value_a_validator(cls, value):
@@ -2823,8 +2879,8 @@ def test_validate_default_raises_for_dataclasses() -> None:
     @pydantic_dataclass
     class Model:
         value_0: str
-        value_a: Annotated[Optional[str], Field(None, validate_default=True)]
-        value_b: Annotated[Optional[str], Field(None, validate_default=True)]
+        value_a: Annotated[str | None, Field(None, validate_default=True)]
+        value_b: Annotated[str | None, Field(None, validate_default=True)]
 
         @field_validator('value_a', mode='after')
         def value_a_validator(cls, value):
@@ -2872,6 +2928,45 @@ def test_plain_validator_plain_serializer() -> None:
     assert isinstance(data['bar'], ser_type)
 
 
+def test_plain_validator_plain_serializer_single_ser_call() -> None:
+    """https://github.com/pydantic/pydantic/issues/10385"""
+
+    ser_count = 0
+
+    def ser(v):
+        nonlocal ser_count
+        ser_count += 1
+        return v
+
+    class Model(BaseModel):
+        foo: Annotated[bool, PlainSerializer(ser), PlainValidator(lambda v: v)]
+
+    model = Model(foo=True)
+    data = model.model_dump()
+
+    assert data == {'foo': True}
+    assert ser_count == 1
+
+
+@pytest.mark.xfail(reason='https://github.com/pydantic/pydantic/issues/10428')
+def test_plain_validator_with_filter_dict_schema() -> None:
+    class MyDict:
+        @classmethod
+        def __get_pydantic_core_schema__(cls, source, handler):
+            return core_schema.dict_schema(
+                keys_schema=handler.generate_schema(str),
+                values_schema=handler.generate_schema(int),
+                serialization=core_schema.filter_dict_schema(
+                    include={'a'},
+                ),
+            )
+
+    class Model(BaseModel):
+        f: Annotated[MyDict, PlainValidator(lambda v: v)]
+
+    assert Model(f={'a': 1, 'b': 1}).model_dump() == {'f': {'a': 1}}
+
+
 def test_plain_validator_with_unsupported_type() -> None:
     class UnsupportedClass:
         pass
@@ -2886,3 +2981,199 @@ def test_plain_validator_with_unsupported_type() -> None:
     model = type_adapter.validate_python('abcdefg')
     assert isinstance(model, UnsupportedClass)
     assert isinstance(type_adapter.dump_python(model), UnsupportedClass)
+
+
+def test_validator_with_default_values() -> None:
+    def validate_x(v: int, unrelated_arg: int = 1, other_unrelated_arg: int = 2) -> int:
+        assert v != -1
+        return v
+
+    class Model(BaseModel):
+        x: int
+
+        val_x = field_validator('x')(validate_x)
+
+    with pytest.raises(ValidationError):
+        Model(x=-1)
+
+
+def test_field_validator_input_type_invalid_mode() -> None:
+    with pytest.raises(
+        PydanticUserError, match=re.escape("`json_schema_input_type` can't be used when mode is set to 'after'")
+    ):
+
+        class Model(BaseModel):
+            a: int
+
+            @field_validator('a', mode='after', json_schema_input_type=int | str)  # pyright: ignore
+            @classmethod
+            def validate_a(cls, value: Any) -> Any: ...
+
+
+def test_non_self_return_val_warns() -> None:
+    class Child(BaseModel):
+        name: str
+
+        @model_validator(mode='after')  # type: ignore
+        def validate_model(self) -> 'Child':
+            return Child.model_construct(name='different')
+
+    with pytest.warns(UserWarning, match='A custom validator is returning a value other than `self`') as warning_info:
+        c = Child(name='name')
+        # confirmation of behavior: non-self return value is ignored
+        assert c.name == 'name'
+    assert f'https://pydantic.dev/docs/validation/{version_short()}/concepts/validators/#model-validators' in str(
+        warning_info[0].message
+    )
+
+
+def test_wrap_val_called_once() -> None:
+    """See https://github.com/pydantic/pydantic/issues/11505 for context.
+
+    This is effectively confirming that prebuilt validators aren't used for wrap validators.
+    """
+
+    class MyModel(BaseModel):
+        inner_value: str
+
+        @model_validator(mode='wrap')
+        @classmethod
+        def my_wrap_validator(cls, data, validator):
+            data['inner_value'] = 'wrap_prefix:' + data['inner_value']
+            return validator(data)
+
+    class MyParentModel(BaseModel):
+        nested: MyModel
+
+        @field_validator('nested', mode='wrap')
+        @classmethod
+        def wrapped_field_serializer(cls, field_value, validator):
+            return validator(field_value)
+
+    my_model = MyParentModel.model_validate({'nested': {'inner_value': 'foo'}})
+    assert my_model.nested.inner_value == 'wrap_prefix:foo'
+
+
+def test_after_val_called_once() -> None:
+    """See https://github.com/pydantic/pydantic/issues/11505 for context.
+
+    This is effectively confirming that prebuilt validators aren't used for after validators.
+    """
+
+    class MyModel(BaseModel):
+        inner_value: str
+
+        @model_validator(mode='after')
+        def my_after_validator(self):
+            self.inner_value = 'after_prefix:' + self.inner_value
+            return self
+
+    class MyParentModel(BaseModel):
+        nested: MyModel
+
+        @field_validator('nested', mode='wrap')
+        @classmethod
+        def wrapped_field_serializer(cls, field_value, validator):
+            return validator(field_value)
+
+    my_model = MyParentModel.model_validate({'nested': {'inner_value': 'foo'}})
+    assert my_model.nested.inner_value == 'after_prefix:foo'
+
+
+def test_after_and_wrap_combo_called_once() -> None:
+    """See https://github.com/pydantic/pydantic/issues/11505 for context.
+
+    This is effectively confirming that prebuilt validators aren't used for combinations of wrap and after validators.
+    """
+
+    class MyModel(BaseModel):
+        inner_value: str
+
+        @model_validator(mode='wrap')
+        @classmethod
+        def my_wrap_validator(cls, data, validator):
+            data['inner_value'] = 'wrap_prefix:' + data['inner_value']
+            return validator(data)
+
+        @model_validator(mode='after')
+        def my_after_validator(self):
+            self.inner_value = 'after_prefix:' + self.inner_value
+            return self
+
+    class MyParentModel(BaseModel):
+        nested: MyModel
+
+        @field_validator('nested', mode='wrap')
+        @classmethod
+        def wrapped_field_serializer(cls, field_value, validator):
+            return validator(field_value)
+
+    my_model = MyParentModel.model_validate({'nested': {'inner_value': 'foo'}})
+    assert my_model.nested.inner_value == 'after_prefix:wrap_prefix:foo'
+
+
+@pytest.mark.xfail(
+    reason="Bug: Nested 'after' model_validator is re-executed. See issue #8452.", raises=ValidationError
+)
+def test_nested_model_validator_not_reexecuted():
+    """See https://github.com/pydantic/pydantic/issues/8452 for context.
+
+    Reproduces the bug in issue #8452 where a nested model's `model_validator` with `mode='after'` is unexpectedly re-executed.
+    """
+
+    class Sub(BaseModel):
+        @model_validator(mode='after')
+        def _validate(self):
+            # This line should not be reached when `Sub` is nested inside `Base`
+            assert False, 'Sub model_validator was re-executed'
+
+    class Base(BaseModel):
+        sub: Sub  # <-- This throws AssertionError
+
+    sub: Sub = (
+        Sub.model_construct()
+    )  # Create a Sub instance without triggering validation (e.g., using model_construct)
+    # Attempt to create Base with the Sub instance. This line should succeed if the bug is fixed, but currently raises ValidationError.
+    Base(sub=sub)  # <-- This throws AssertionError because Sub's 'after' validator runs again.
+
+
+def test_model_validate_by_json_field_validator_with_validation_info() -> None:
+    """https://github.com/pydantic/pydantic/issues/13074"""
+
+    class Foo(BaseModel):
+        field1: int
+        field2: int
+
+        @field_validator('field2')
+        @classmethod
+        def _validate_field2(cls, v: int, info: ValidationInfo) -> int:
+            assert info.field_name in ('field1', 'field2')
+            assert info.context == 'context'
+
+            return v + info.data['field1']
+
+    f1 = Foo.model_validate({'field1': 1, 'field2': 2}, context='context')
+    f2 = Foo.model_validate_json('{"field1": 1, "field2": 2}', context='context')
+
+    assert f1.field1 == f2.field1 == 1
+    assert f1.field2 == f2.field2 == 3
+
+
+def test_model_validate_json_default_value_validator_with_validation_info() -> None:
+    """https://github.com/pydantic/pydantic/issues/13074"""
+
+    class Foo(BaseModel, validate_default=True):
+        field: int = 1
+
+        @field_validator('field')
+        @classmethod
+        def _validate_field(cls, v: int, info: ValidationInfo) -> int:
+            assert info.field_name == 'field'
+            assert info.context == 'context'
+
+            return v + 1
+
+    f1 = Foo.model_validate({'field': 1}, context='context')
+    f2 = Foo.model_validate_json('{"field1": 1}', context='context')
+
+    assert f1.field == f2.field == 2

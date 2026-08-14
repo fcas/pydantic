@@ -13,6 +13,14 @@ To solve these problems, Pydantic supports three fundamental approaches to valid
 2. [smart mode](#smart-mode) - similar to "left to right mode" members are tried in order; however, validation will proceed past the first match to attempt to find a better match, this is the default mode for most union validation
 3. [discriminated unions](#discriminated-unions) - only one member of the union is tried, based on a discriminator
 
+!!! tip
+
+    In general, we recommend using [discriminated unions](#discriminated-unions). They are both more performant and more predictable than untagged unions, as they allow you to control which member of the union to validate against.
+
+    For complex cases, if you're using untagged unions, it's recommended to use `union_mode='left_to_right'` if you need guarantees about the order of validation attempts against the union members.
+
+    If you're looking for incredibly specialized behavior, you can use a [custom validator](../concepts/validators.md#field-validators).
+
 ## Union Modes
 
 ### Left to Right Mode
@@ -26,14 +34,12 @@ If validation fails on all members, the validation error includes the errors fro
 
 `union_mode='left_to_right'` must be set as a [`Field`](../concepts/fields.md) parameter on union fields where you want to use it.
 
-```py title="Union with left to right mode"
-from typing import Union
-
+```python {title="Union with left to right mode"}
 from pydantic import BaseModel, Field, ValidationError
 
 
 class User(BaseModel):
-    id: Union[str, int] = Field(union_mode='left_to_right')
+    id: str | int = Field(union_mode='left_to_right')
 
 
 print(User(id=123))
@@ -56,14 +62,12 @@ except ValidationError as e:
 
 The order of members is very important in this case, as demonstrated by tweak the above example:
 
-```py title="Union with left to right - unexpected results"
-from typing import Union
-
+```python {title="Union with left to right - unexpected results"}
 from pydantic import BaseModel, Field
 
 
 class User(BaseModel):
-    id: Union[int, str] = Field(union_mode='left_to_right')
+    id: int | str = Field(union_mode='left_to_right')
 
 
 print(User(id=123))  # (1)
@@ -78,33 +82,70 @@ print(User(id='456'))  # (2)
 
 ### Smart Mode
 
-Because of the surprising side effects of `union_mode='left_to_right'`, in Pydantic >=2 the default mode for `Union` validation is `union_mode='smart'`.
+Because of the potentially surprising results of `union_mode='left_to_right'`, in Pydantic >=2 the default mode for union validation is `union_mode='smart'`.
 
-In this mode, pydantic scores a match of a union member into one of the following three groups (from highest score to lowest score):
+In this mode, pydantic attempts to select the best match for the input from the union members. The exact algorithm may change between Pydantic minor releases to allow for improvements in both performance and accuracy.
 
-- An exact type match, for example an `int` input to a `float | int` union validation is an exact type match for the `int` member
-- Validation would have succeeded in [`strict` mode](../concepts/strict_mode.md)
-- Validation would have succeeded in lax mode
+!!! note
 
-The union match which produced the highest score will be selected as the best match.
+    We reserve the right to tweak the internal `smart` matching algorithm in future versions of Pydantic. If you rely on very specific
+    matching behavior, it's recommended to use `union_mode='left_to_right'` or [discriminated unions](#discriminated-unions).
 
-In this mode, the following steps are taken to try to select the best match for the input:
+??? info "Smart Mode Algorithm"
 
-1. Union members are attempted left to right, with any successful matches scored into one of the three categories described above.
-  - If validation succeeds with an exact type match, that member is returned immediately and following members will not be attempted.
-2. If validation succeeded on at least one member as a "strict" match, the leftmost of those "strict" matches is returned.
-3. If validation succeeded on at least one member in "lax" mode, the leftmost match is returned.
-4. Validation failed on all the members, return all the errors.
+    The smart mode algorithm uses two metrics to determine the best match for the input:
 
-```py
-from typing import Union
+    1. The number of valid fields set (relevant for models, dataclasses, and typed dicts)
+    2. The exactness of the match (relevant for all types)
+
+    #### Number of valid fields set
+
+    !!! note
+        This metric was introduced in Pydantic v2.8.0. Prior to this version, only exactness was used to determine the best match.
+
+    This metric is currently only relevant for models, dataclasses, and typed dicts.
+
+    The greater the number of valid fields set, the better the match. The number of fields set on nested models is also taken into account.
+    These counts bubble up to the top-level union, where the union member with the highest count is considered the best match.
+
+    For data types where this metric is relevant, we prioritize this count over exactness. For all other types, we use solely exactness.
+
+    #### Exactness
+
+    For `exactness`, Pydantic scores a match of a union member into one of the following three groups (from highest score to lowest score):
+
+    * An exact type match, for example an `int` input to a `float | int` union validation is an exact type match for the `int` member
+    * Validation would have succeeded in [`strict` mode](../concepts/strict_mode.md)
+    * Validation would have succeeded in lax mode
+
+    The union match which produced the highest exactness score will be considered the best match.
+
+    In smart mode, the following steps are taken to try to select the best match for the input:
+
+    === "`BaseModel`, `dataclass`, and `TypedDict`"
+
+        1. Union members are attempted left to right, with any successful matches scored into one of the three exactness categories described above,
+        with the valid fields set count also tallied.
+        2. After all members have been evaluated, the member with the highest "valid fields set" count is returned.
+        3. If there's a tie for the highest "valid fields set" count, the exactness score is used as a tiebreaker, and the member with the highest exactness score is returned.
+        4. If validation failed on all the members, return all the errors.
+
+    === "All other data types"
+
+        1. Union members are attempted left to right, with any successful matches scored into one of the three exactness categories described above.
+            * If validation succeeds with an exact type match, that member is returned immediately and following members will not be attempted.
+        2. If validation succeeded on at least one member as a "strict" match, the leftmost of those "strict" matches is returned.
+        3. If validation succeeded on at least one member in "lax" mode, the leftmost match is returned.
+        4. Validation failed on all the members, return all the errors.
+
+```python
 from uuid import UUID
 
 from pydantic import BaseModel
 
 
 class User(BaseModel):
-    id: Union[int, str, UUID]
+    id: int | str | UUID
     name: str
 
 
@@ -128,34 +169,31 @@ print(user_03_uuid.int)
 #> 275603287559914445491632874575877060712
 ```
 
-!!! tip
-    The type `Optional[x]` is a shorthand for `Union[x, None]`.
+## Discriminated unions
 
-    See more details in [Required fields](../concepts/models.md#required-fields).
+**Discriminated unions are sometimes referred to as "Tagged unions".**
 
-## Discriminated Unions
-
-**Discriminated unions are sometimes referred to as "Tagged Unions".**
-
-We can use discriminated unions to more efficiently validate `Union` types, by choosing which member of the union to validate against.
-
+Unions can be validated more efficiently using a discriminator, by specifically choosing which member of the union to validate against.
 This makes validation more efficient and also avoids a proliferation of errors when validation fails.
 
-Adding discriminator to unions also means the generated JSON schema implements the [associated OpenAPI specification](https://github.com/OAI/OpenAPI-Specification/blob/main/versions/3.1.0.md#discriminator-object).
+Adding discriminator to unions also means the generated JSON schema implements the `discriminator` attribute from the
+[OpenAPI specification](https://swagger.io/specification/#discriminator-object).
 
-### Discriminated Unions with `str` discriminators
+<!-- old anchor added for backwards compatibility -->
+<!-- markdownlint-disable-next-line no-empty-links -->
+[](){#discriminated-unions-with-str-discriminators}
 
-Frequently, in the case of a `Union` with multiple models,
-there is a common field to all members of the union that can be used to distinguish
-which union case the data should be validated against; this is referred to as the "discriminator" in
-[OpenAPI](https://swagger.io/docs/specification/data-models/inheritance-and-polymorphism/).
+### Discriminated unions with string discriminators
 
-To validate models based on that information you can set the same field - let's call it `my_discriminator` -
-in each of the models with a discriminated value, which is one (or many) `Literal` value(s).
-For your `Union`, you can set the discriminator in its value: `Field(discriminator='my_discriminator')`.
+Frequently, in the case of a union with multiple models, there is a common field to all members of the union
+that can be used to distinguish which union case the data should be validated against.
 
-```py requires="3.8"
-from typing import Literal, Union
+To validate models based on that information, you can set a common field on each model of the union (`pet_type` in the example below),
+typed as accepting one or multiple literal values. When defining the discriminated union type, the `discriminator` parameter of
+[the `Field()` function](./fields.md) must be specified (the [`Discriminator`][pydantic.Discriminator] type can also be used).
+
+```python
+from typing import Literal
 
 from pydantic import BaseModel, Field, ValidationError
 
@@ -176,7 +214,7 @@ class Lizard(BaseModel):
 
 
 class Model(BaseModel):
-    pet: Union[Cat, Dog, Lizard] = Field(..., discriminator='pet_type')
+    pet: Cat | Dog | Lizard = Field(discriminator='pet_type')
     n: int
 
 
@@ -193,19 +231,34 @@ except ValidationError as e:
     """
 ```
 
+/// version-added | v2.13
+[Root models](./models.md#rootmodel-and-custom-root-types) with a [`Literal`][typing.Literal] root type can be used in place of [`Literal`][typing.Literal] types.
+///
+
 ### Discriminated Unions with callable `Discriminator`
 
 ??? api "API Documentation"
     [`pydantic.types.Discriminator`][pydantic.types.Discriminator]<br>
 
-In the case of a `Union` with multiple models, sometimes there isn't a single uniform field
+In the case of a union with multiple models, sometimes there isn't a single uniform field
 across all models that you can use as a discriminator.
 This is the perfect use case for a callable `Discriminator`.
 
-```py requires="3.8"
-from typing import Any, Literal, Union
+!!! tip
+    When you're designing callable discriminators, remember that you might have to account
+    for both `dict` and model type inputs. This pattern is similar to that of `mode='before'` validators,
+    where you have to anticipate various forms of input.
 
-from typing_extensions import Annotated
+    But wait! You ask, I only anticipate passing in `dict` types, why do I need to account for models?
+    Pydantic uses callable discriminators for serialization as well, at which point the input to your callable is
+    very likely to be a model instance.
+
+    In the following examples, you'll see that the callable discriminators are designed to handle both `dict` and model inputs.
+    If you don't follow this practice, it's likely that you'll, in the best case, get warnings during serialization,
+    and in the worst case, get runtime errors during validation.
+
+```python {lint="skip"}
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, Discriminator, Tag
 
@@ -223,7 +276,7 @@ class PumpkinPie(Pie):
     filling: Literal['pumpkin'] = 'pumpkin'
 
 
-def get_discriminator_value(v: Any) -> str:
+def get_discriminator_value(v: Any) -> str | None:
     if isinstance(v, dict):
         return v.get('fruit', v.get('filling'))
     return getattr(v, 'fruit', getattr(v, 'filling', None))
@@ -231,10 +284,7 @@ def get_discriminator_value(v: Any) -> str:
 
 class ThanksgivingDinner(BaseModel):
     dessert: Annotated[
-        Union[
-            Annotated[ApplePie, Tag('apple')],
-            Annotated[PumpkinPie, Tag('pumpkin')],
-        ],
+        Annotated[ApplePie, Tag('apple')] | Annotated[PumpkinPie, Tag('pumpkin')],
         Discriminator(get_discriminator_value),
     ]
 
@@ -262,19 +312,17 @@ ThanksgivingDinner(dessert=PumpkinPie(time_to_cook=40, num_ingredients=6, fillin
 """
 ```
 
-`Discriminator`s can also be used to validate `Union` types with combinations of models and primitive types.
+`Discriminator`s can also be used to validate union types with combinations of models and primitive types.
 
 For example:
 
-```py requires="3.8"
-from typing import Any, Union
-
-from typing_extensions import Annotated
+```python {lint="skip"}
+from typing import Annotated, Any
 
 from pydantic import BaseModel, Discriminator, Tag, ValidationError
 
 
-def model_x_discriminator(v: Any) -> str:
+def model_x_discriminator(v: Any) -> str | None:
     if isinstance(v, int):
         return 'int'
     if isinstance(v, (dict, BaseModel)):
@@ -290,10 +338,7 @@ class SpecialValue(BaseModel):
 
 class DiscriminatedModel(BaseModel):
     value: Annotated[
-        Union[
-            Annotated[int, Tag('int')],
-            Annotated['SpecialValue', Tag('model')],
-        ],
+        Annotated[int, Tag('int')] | Annotated['SpecialValue', Tag('model')],
         Discriminator(model_x_discriminator),
     ]
 
@@ -323,39 +368,33 @@ except ValidationError as e:
    When `None` is returned, this `union_tag_not_found` error is raised.
 
 !!! note
-    Using the [[`typing.Annotated`][] fields syntax](../concepts/json_schema.md#typingannotated-fields) can be handy to regroup
-    the `Union` and `discriminator` information. See the next example for more details.
+    Using the [annotated pattern](./fields.md#the-annotated-pattern) can be handy to regroup
+    the union and `discriminator` information. See the next example for more details.
 
     There are a few ways to set a discriminator for a field, all varying slightly in syntax.
 
     For `str` discriminators:
-    ```
-    some_field: Union[...] = Field(discriminator='my_discriminator'
-    some_field: Annotated[Union[...], Field(discriminator='my_discriminator')]
+
+    ```python {lint="skip" test="skip"}
+    some_field: ... | ... = Field(discriminator='my_discriminator')
+    some_field: Annotated[... | ..., Field(discriminator='my_discriminator')]
     ```
 
     For callable `Discriminator`s:
-    ```
-    some_field: Union[...] = Field(discriminator=Discriminator(...))
-    some_field: Annotated[Union[...], Discriminator(...)]
-    some_field: Annotated[Union[...], Field(discriminator=Discriminator(...))]
-    ```
 
-!!! warning
-    Discriminated unions cannot be used with only a single variant, such as `Union[Cat]`.
-
-    Python changes `Union[T]` into `T` at interpretation time, so it is not possible for `pydantic` to
-    distinguish fields of `Union[T]` from `T`.
+    ```python {lint="skip" test="skip"}
+    some_field: ... | ... = Field(discriminator=Discriminator(...))
+    some_field: Annotated[... | ..., Discriminator(...)]
+    some_field: Annotated[... | ..., Field(discriminator=Discriminator(...))]
+    ```
 
 ### Nested Discriminated Unions
 
 Only one discriminator can be set for a field but sometimes you want to combine multiple discriminators.
 You can do it by creating nested `Annotated` types, e.g.:
 
-```py requires="3.8"
-from typing import Literal, Union
-
-from typing_extensions import Annotated
+```python
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field, ValidationError
 
@@ -372,7 +411,7 @@ class WhiteCat(BaseModel):
     white_name: str
 
 
-Cat = Annotated[Union[BlackCat, WhiteCat], Field(discriminator='color')]
+Cat = Annotated[BlackCat | WhiteCat, Field(discriminator='color')]
 
 
 class Dog(BaseModel):
@@ -380,7 +419,7 @@ class Dog(BaseModel):
     name: str
 
 
-Pet = Annotated[Union[Cat, Dog], Field(discriminator='pet_type')]
+Pet = Annotated[Cat | Dog, Field(discriminator='pet_type')]
 
 
 class Model(BaseModel):
@@ -411,29 +450,47 @@ except ValidationError as e:
     """
 ```
 
+!!! tip
+    If you want to validate data against a union, and solely a union, you can use pydantic's [`TypeAdapter`](../concepts/type_adapter.md) construct instead of inheriting from the standard `BaseModel`.
+
+    In the context of the previous example, we have the following:
+
+    ```python {lint="skip" test="skip"}
+    type_adapter = TypeAdapter(Pet)
+
+    pet = type_adapter.validate_python(
+        {'pet_type': 'cat', 'color': 'black', 'black_name': 'felix'}
+    )
+    print(repr(pet))
+    #> BlackCat(pet_type='cat', color='black', black_name='felix')
+    ```
+
 ## Union Validation Errors
 
-When `Union` validation fails, error messages can be quite verbose, as they will produce validation errors for
+When union validation fails, error messages can be quite verbose, as they will produce validation errors for
 each case in the union.
 This is especially noticeable when dealing with recursive models, where reasons may be generated at each level of
 recursion.
 Discriminated unions help to simplify error messages in this case, as validation errors are only produced for
 the case with a matching discriminator value.
 
+Making sense of a union failure means working out which member *should* have matched. A
+[`ValidationError`][pydantic_core.ValidationError] includes each member's errors and rejected values;
+when the failure happens in a deployed service, [Logfire retains those details with the complete
+validation input](../errors/troubleshooting.md), so you can make that comparison after the fact.
+
 You can also customize the error type, message, and context for a `Discriminator` by passing
 these specifications as parameters to the `Discriminator` constructor, as seen in the example below.
 
-```py
-from typing import Union
-
-from typing_extensions import Annotated
+```python {lint="skip"}
+from typing import Annotated
 
 from pydantic import BaseModel, Discriminator, Tag, ValidationError
 
 
-# Errors are quite verbose with a normal Union:
+# Errors are quite verbose with a normal union:
 class Model(BaseModel):
-    x: Union[str, 'Model']
+    x: 'str | Model'
 
 
 try:
@@ -479,10 +536,7 @@ def model_x_discriminator(v):
 
 class DiscriminatedModel(BaseModel):
     x: Annotated[
-        Union[
-            Annotated[str, Tag('str')],
-            Annotated['DiscriminatedModel', Tag('model')],
-        ],
+        Annotated[str, Tag('str')] | Annotated['DiscriminatedModel', Tag('model')],
         Discriminator(
             model_x_discriminator,
             custom_error_type='invalid_union_member',  # (1)!
@@ -526,19 +580,17 @@ print(m.model_dump())
 You can also simplify error messages by labeling each case with a [`Tag`][pydantic.types.Tag].
 This is especially useful when you have complex types like those in this example:
 
-```py
-from typing import Dict, List, Union
-
-from typing_extensions import Annotated
+```python {lint="skip"}
+from typing import Annotated
 
 from pydantic import AfterValidator, Tag, TypeAdapter, ValidationError
 
-DoubledList = Annotated[List[int], AfterValidator(lambda x: x * 2)]
-StringsMap = Dict[str, str]
+DoubledList = Annotated[list[int], AfterValidator(lambda x: x * 2)]
+StringsMap = dict[str, str]
 
 
 # Not using any `Tag`s for each union case, the errors are not so nice to look at
-adapter = TypeAdapter(Union[DoubledList, StringsMap])
+adapter = TypeAdapter(DoubledList | StringsMap)
 
 try:
     adapter.validate_python(['a'])
@@ -553,10 +605,7 @@ except ValidationError as exc_info:
     """
 
 tag_adapter = TypeAdapter(
-    Union[
-        Annotated[DoubledList, Tag('DoubledList')],
-        Annotated[StringsMap, Tag('StringsMap')],
-    ]
+    Annotated[DoubledList, Tag('DoubledList')] | Annotated[StringsMap, Tag('StringsMap')]
 )
 
 try:

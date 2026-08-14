@@ -10,14 +10,18 @@ from textwrap import indent
 
 import autoflake
 import pyupgrade._main as pyupgrade_main  # type: ignore
+import requests
 import tomli
 import yaml
+from build.__main__ import (
+    build_package,
+)  # Might be private, but there's currently no public API to programmatically build wheels..
 from jinja2 import Template  # type: ignore
-from mkdocs.config import Config
+from mkdocs.config.defaults import MkDocsConfig
+from mkdocs.exceptions import PluginError
 from mkdocs.structure.files import Files
 from mkdocs.structure.pages import Page
-
-from .conversion_table import conversion_table
+from packaging.version import Version
 
 logger = logging.getLogger('mkdocs.plugin')
 THIS_DIR = Path(__file__).parent
@@ -25,31 +29,39 @@ DOCS_DIR = THIS_DIR.parent
 PROJECT_ROOT = DOCS_DIR.parent
 
 
-def on_pre_build(config: Config) -> None:
+try:
+    from .conversion_table import conversion_table
+except ImportError:
+    # Due to how MkDocs requires this file to be specified (as a path and not a
+    # dot-separated module name), relative imports don't work:
+    # MkDocs is adding the dir. of this file to `sys.path` and uses
+    # `importlib.spec_from_file_location` and `module_from_spec`, which isn't ideal.
+    from conversion_table import conversion_table
+
+# Start definition of MkDocs hooks
+
+
+def on_pre_build(config: MkDocsConfig) -> None:
     """
     Before the build starts.
     """
     add_changelog()
-    add_mkdocs_run_deps()
+    if not config.site_url:
+        raise PluginError("'site_url' must be set")
+    add_mkdocs_run_deps(config.site_url)
 
 
-def on_files(files: Files, config: Config) -> Files:
-    """
-    After the files are loaded, but before they are read.
-    """
-    return files
-
-
-def on_page_markdown(markdown: str, page: Page, config: Config, files: Files) -> str:
+def on_page_markdown(markdown: str, page: Page, config: MkDocsConfig, files: Files) -> str:
     """
     Called on each file after it is read and before it is converted to HTML.
     """
     markdown = upgrade_python(markdown)
     markdown = insert_json_output(markdown)
-    markdown = remove_code_fence_attributes(markdown)
     if md := render_index(markdown, page):
         return md
     if md := render_why(markdown, page):
+        return md
+    if md := render_pydantic_settings(markdown, page):
         return md
     elif md := build_schema_mappings(markdown, page):
         return md
@@ -61,6 +73,9 @@ def on_page_markdown(markdown: str, page: Page, config: Config, files: Files) ->
         return md
     else:
         return markdown
+
+
+# End definition of MkDocs hooks
 
 
 def add_changelog() -> None:
@@ -75,20 +90,38 @@ def add_changelog() -> None:
         new_file.write_text(history, encoding='utf-8')
 
 
-def add_mkdocs_run_deps() -> None:
+def add_mkdocs_run_deps(site_url: str) -> None:
     # set the pydantic, pydantic-core, pydantic-extra-types versions to configure for running examples in the browser
     pyproject_toml = (PROJECT_ROOT / 'pyproject.toml').read_text()
-    pydantic_core_version = re.search(r'pydantic-core==(.+?)["\']', pyproject_toml).group(1)
+    m = re.search(r'pydantic-core==(.+?)["\']', pyproject_toml)
+    if not m:
+        logger.info(
+            "Could not find pydantic-core version in pyproject.toml, this is expected if you're using a git ref"
+        )
+        return
+
+    pydantic_core_version = m.group(1)
 
     version_py = (PROJECT_ROOT / 'pydantic' / 'version.py').read_text()
-    pydantic_version = re.search(r'^VERSION ?= (["\'])(.+)\1', version_py, flags=re.M).group(2)
+    pydantic_version_str: str = re.search(r'^VERSION ?= (["\'])(.+)\1', version_py, flags=re.M).group(2)  # pyright: ignore[reportOptionalMemberAccess]
+    if os.getenv('CI') and Version(pydantic_version_str).local == 'dev':
+        build_package(
+            PROJECT_ROOT,
+            DOCS_DIR,
+            distributions=['wheel'],
+        )
+        wheel_file = next(DOCS_DIR.glob('*.whl'))
+        pydantic_dep = f'{site_url.removesuffix("/").removesuffix("/latest")}/dev/{wheel_file.name}'
+    else:
+        pydantic_dep = f'pydantic=={pydantic_version_str}'
 
-    pdm_lock = (PROJECT_ROOT / 'pdm.lock').read_text()
-    pydantic_extra_types_version = re.search(r'name = "pydantic-extra-types"\nversion = "(.+?)"', pdm_lock).group(1)
+    uv_lock = (PROJECT_ROOT / 'uv.lock').read_text()
+    pydantic_extra_types_version: str = re.search(r'name = "pydantic-extra-types"\nversion = "(.+?)"', uv_lock).group(1)  # pyright: ignore[reportOptionalMemberAccess]
 
     mkdocs_run_deps = json.dumps(
         [
-            f'pydantic=={pydantic_version}',
+            pydantic_dep,
+            'email-validator>=2.0.0',
             f'pydantic-core=={pydantic_core_version}',
             f'pydantic-extra-types=={pydantic_extra_types_version}',
         ]
@@ -104,13 +137,13 @@ def add_mkdocs_run_deps() -> None:
     path.write_text(html)
 
 
-MIN_MINOR_VERSION = 7
-MAX_MINOR_VERSION = 11
+MIN_MINOR_VERSION = 9
+MAX_MINOR_VERSION = 13
 
 
 def upgrade_python(markdown: str) -> str:
     """
-    Apply pyupgrade to all python code blocks, unless explicitly skipped, create a tab for each version.
+    Apply pyupgrade to all Python code blocks, unless explicitly skipped, create a tab for each version.
     """
 
     def add_tabs(match: re.Match[str]) -> str:
@@ -146,7 +179,10 @@ def upgrade_python(markdown: str) -> str:
         else:
             return '\n\n'.join(output)
 
-    return re.sub(r'^(``` *py.*?)\n(.+?)^```(\s+(?:^\d+\. .+?\n)+)', add_tabs, markdown, flags=re.M | re.S)
+    # Note: we should move away from this regex approach. It does not handle edge cases (indented code blocks inside
+    # other blocks, etc) and can lead to bugs in the rendering of annotations. Edit with care and make sure the rendered
+    # documentation does not break:
+    return re.sub(r'(``` *py.*?)\n(.+?)^```(\s+(?:^\d+\. (?:[^\n][\n]?)+\n?)*)', add_tabs, markdown, flags=re.M | re.S)
 
 
 def _upgrade_code(code: str, min_version: int) -> str:
@@ -180,23 +216,6 @@ def insert_json_output(markdown: str) -> str:
         return f'{start}{attrs}{code}{start}\n'
 
     return re.sub(r'(^ *```)([^\n]*?output="json"[^\n]*?\n)(.+?)\1', replace_json, markdown, flags=re.M | re.S)
-
-
-def remove_code_fence_attributes(markdown: str) -> str:
-    """
-    There's no way to add attributes to code fences that works with both pycharm and mkdocs, hence we use
-    `py key="value"` to provide attributes to pytest-examples, then remove those attributes here.
-
-    https://youtrack.jetbrains.com/issue/IDEA-297873 & https://python-markdown.github.io/extensions/fenced_code_blocks/
-    """
-
-    def remove_attrs(match: re.Match[str]) -> str:
-        suffix = re.sub(
-            r' (?:test|lint|upgrade|group|requires|output|rewrite_assert)=".+?"', '', match.group(2), flags=re.M
-        )
-        return f'{match.group(1)}{suffix}'
-
-    return re.sub(r'^( *``` *py)(.*)', remove_attrs, markdown, flags=re.M)
 
 
 def get_orgs_data() -> list[dict[str, str]]:
@@ -257,6 +276,22 @@ def render_why(markdown: str, page: Page) -> str | None:
     return re.sub(r'{{ *organisations *}}', '\n\n'.join(elements), markdown)
 
 
+def render_pydantic_settings(markdown: str, page: Page) -> str | None:
+    if page.file.src_uri != 'concepts/pydantic_settings.md':
+        return None
+
+    req = requests.get('https://raw.githubusercontent.com/pydantic/pydantic-settings/main/docs/index.md')
+    if req.status_code != 200:
+        logger.warning(
+            'Got HTTP status %d when trying to fetch content of the `pydantic-settings` docs', req.status_code
+        )
+        return
+
+    docs_content = req.text.strip()
+
+    return re.sub(r'{{ *pydantic_settings *}}', docs_content, markdown)
+
+
 def _generate_table_row(col_values: list[str]) -> str:
     return f'| {" | ".join(col_values)} |\n'
 
@@ -266,7 +301,7 @@ def _generate_table_heading(col_names: list[str]) -> str:
 
 
 def build_schema_mappings(markdown: str, page: Page) -> str | None:
-    if page.file.src_uri != 'usage/schema.md':
+    if page.file.src_uri != 'concepts/json_schema.md':
         return None
 
     col_names = [

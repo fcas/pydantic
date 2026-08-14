@@ -1,4 +1,6 @@
-from typing import Any, Dict, Generic, Optional, TypeVar
+from typing import Any, Generic, Optional, TypeVar
+
+from typing_extensions import assert_type
 
 from pydantic import BaseModel
 
@@ -12,7 +14,7 @@ class Response(BaseModel, Generic[Tbody]):
 
 class JsonBody(BaseModel):
     raw: str
-    data: Dict[str, Any]
+    data: dict[str, Any]
 
 
 class HtmlBody(BaseModel):
@@ -35,7 +37,7 @@ example = {'url': 'foo.com', 'body': {'raw': '..<html>..', 'doctype': 'html'}}
 resp = HtmlResponse.model_validate(example)
 resp.custom_method()
 
-doctype = resp.body.doctype
+assert_type(resp.body, HtmlBody)
 
 
 T = TypeVar('T', int, str)
@@ -50,4 +52,23 @@ class DomainType(HistoryField[int]):
 
 
 thing = DomainType(value=None)
-var: Optional[int] = thing.value
+assert_type(thing.value, Optional[int])
+
+
+TElement = TypeVar('TElement', bound='Element')
+
+
+class Element(BaseModel):
+    pass
+
+
+class ElementWithChildren(Element, Generic[TElement]):
+    children: list[TElement] = []
+
+
+class Child(ElementWithChildren['Child']):
+    """https://github.com/pydantic/pydantic/issues/11025"""
+
+
+child = Child(children=[Child()])
+assert_type(child.children, list[Child])

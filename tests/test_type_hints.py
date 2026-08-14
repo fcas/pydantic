@@ -2,14 +2,12 @@
 Test pydantic model type hints (annotations) and that they can be
 queried by :py:meth:`typing.get_type_hints`.
 """
+
 import inspect
-import sys
+from functools import lru_cache
 from typing import (
     Any,
-    Dict,
     Generic,
-    Optional,
-    Set,
     TypeVar,
 )
 
@@ -36,10 +34,8 @@ DEPRECATED_MODEL_MEMBERS = {
 # Disable deprecation warnings, as we enumerate members that may be
 # i.e. pydantic.warnings.PydanticDeprecatedSince20: The `__fields__` attribute is deprecated,
 #      use `model_fields` instead.
-# Additionally, only run these tests for 3.10+
 pytestmark = [
     pytest.mark.filterwarnings('ignore::DeprecationWarning'),
-    pytest.mark.skipif(sys.version_info < (3, 10), reason='requires python3.10 or higher to work properly'),
 ]
 
 
@@ -56,8 +52,35 @@ def parent_sub_model_fixture():
     return ParentModel
 
 
+@lru_cache
+def get_type_checking_only_ns():
+    """
+    When creating `BaseModel` in `pydantic.main`, some globals are imported only when `TYPE_CHECKING` is `True`, so we have to manually include them when calling `typing.get_type_hints`.
+    """
+
+    from inspect import Signature
+
+    from pydantic_core import CoreSchema, SchemaSerializer, SchemaValidator
+
+    from pydantic.deprecated.parse import Protocol as DeprecatedParseProtocol
+    from pydantic.fields import ComputedFieldInfo, FieldInfo, ModelPrivateAttr
+    from pydantic.fields import PrivateAttr as _PrivateAttr
+
+    return {
+        'Signature': Signature,
+        'CoreSchema': CoreSchema,
+        'SchemaSerializer': SchemaSerializer,
+        'SchemaValidator': SchemaValidator,
+        'DeprecatedParseProtocol': DeprecatedParseProtocol,
+        'ComputedFieldInfo': ComputedFieldInfo,
+        'FieldInfo': FieldInfo,
+        'ModelPrivateAttr': ModelPrivateAttr,
+        '_PrivateAttr': _PrivateAttr,
+    }
+
+
 def inspect_type_hints(
-    obj_type, members: Optional[Set[str]] = None, exclude_members: Optional[Set[str]] = None, recursion_limit: int = 3
+    obj_type, members: set[str] | None = None, exclude_members: set[str] | None = None, recursion_limit: int = 3
 ):
     """
     Test an object and its members to make sure type hints can be resolved.
@@ -68,7 +91,7 @@ def inspect_type_hints(
     """
 
     try:
-        hints = typing_extensions.get_type_hints(obj_type)
+        hints = typing_extensions.get_type_hints(obj_type, localns=get_type_checking_only_ns())
         assert isinstance(hints, dict), f'Type annotation(s) on {obj_type} are invalid'
     except NameError as ex:
         raise AssertionError(f'Type annotation(s) on {obj_type} are invalid: {str(ex)}') from ex
@@ -97,7 +120,7 @@ def inspect_type_hints(
         (RootModel, None, DEPRECATED_MODEL_MEMBERS),
     ],
 )
-def test_obj_type_hints(obj_type, members: Optional[Set[str]], exclude_members: Optional[Set[str]]):
+def test_obj_type_hints(obj_type, members: set[str] | None, exclude_members: set[str] | None):
     """
     Test an object and its members to make sure type hints can be resolved.
     :param obj_type: Type to check
@@ -129,7 +152,7 @@ def test_generics():
         data: data_type
 
     inspect_type_hints(Result, None, DEPRECATED_MODEL_MEMBERS)
-    inspect_type_hints(Result[Dict[str, Any]], None, DEPRECATED_MODEL_MEMBERS)
+    inspect_type_hints(Result[dict[str, Any]], None, DEPRECATED_MODEL_MEMBERS)
 
 
 def test_dataclasses():

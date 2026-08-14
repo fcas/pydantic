@@ -3,41 +3,33 @@ import itertools
 import json
 import platform
 import re
+import subprocess
 import sys
-from collections import deque
+import weakref
+from collections import Counter, OrderedDict, defaultdict, deque
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from enum import Enum, IntEnum
+from textwrap import dedent
 from typing import (
+    Annotated,
     Any,
-    Callable,
     ClassVar,
-    Counter,
-    DefaultDict,
-    Deque,
-    Dict,
-    FrozenSet,
     Generic,
-    Iterable,
-    List,
-    Mapping,
+    Literal,
     NamedTuple,
     Optional,
-    OrderedDict,
-    Sequence,
-    Set,
-    Tuple,
-    Type,
     TypeVar,
-    Union,
 )
 
 import pytest
 from dirty_equals import HasRepr, IsStr
 from pydantic_core import CoreSchema, core_schema
-from typing_extensions import (
-    Annotated,
-    Literal,
+from pytest_mock import MockerFixture
+from typing_extensions import (  # noqa: UP035 (for `get_args`)
+    Never,
     NotRequired,
     ParamSpec,
+    TypeAliasType,
     TypedDict,
     TypeVarTuple,
     Unpack,
@@ -62,10 +54,9 @@ from pydantic import (
     field_validator,
     model_validator,
 )
-from pydantic._internal._core_utils import collect_invalid_schemas
 from pydantic._internal._generics import (
-    _GENERIC_TYPES_CACHE,
     _LIMITED_DICT_SIZE,
+    GenericTypesCache,
     LimitedDict,
     generic_recursion_self_type,
     iter_contained_typevars,
@@ -75,24 +66,14 @@ from pydantic._internal._generics import (
 from pydantic.warnings import GenericBeforeBaseModelWarning
 
 
-@pytest.fixture()
-def clean_cache():
-    # cleans up _GENERIC_TYPES_CACHE for checking item counts in the cache
-    _GENERIC_TYPES_CACHE.clear()
-    gc.collect(0)
-    gc.collect(1)
-    gc.collect(2)
-
-
 def test_generic_name():
     data_type = TypeVar('data_type')
 
     class Result(BaseModel, Generic[data_type]):
         data: data_type
 
-    if sys.version_info >= (3, 9):
-        assert Result[list[int]].__name__ == 'Result[list[int]]'
-    assert Result[List[int]].__name__ == 'Result[List[int]]'
+    assert Result[list[int]].__name__ == 'Result[list[int]]'
+    assert Result[list[int]].__name__ == 'Result[list[int]]'
     assert Result[int].__name__ == 'Result[int]'
 
 
@@ -109,7 +90,7 @@ def test_double_parameterize_error():
 
 
 def test_value_validation():
-    T = TypeVar('T', bound=Dict[Any, Any])
+    T = TypeVar('T', bound=dict[Any, Any])
 
     class Response(BaseModel, Generic[T]):
         data: T
@@ -128,9 +109,9 @@ def test_value_validation():
                 raise ValueError('sum too large')
             return self
 
-    assert Response[Dict[int, int]](data={1: '4'}).model_dump() == {'data': {1: 4}}
+    assert Response[dict[int, int]](data={1: '4'}).model_dump() == {'data': {1: 4}}
     with pytest.raises(ValidationError) as exc_info:
-        Response[Dict[int, int]](data={1: 'a'})
+        Response[dict[int, int]](data={1: 'a'})
     assert exc_info.value.errors(include_url=False) == [
         {
             'type': 'int_parsing',
@@ -141,7 +122,7 @@ def test_value_validation():
     ]
 
     with pytest.raises(ValidationError) as exc_info:
-        Response[Dict[int, int]](data={1: 0})
+        Response[dict[int, int]](data={1: 0})
     assert exc_info.value.errors(include_url=False) == [
         {
             'ctx': {'error': HasRepr(repr(ValueError('some value is zero')))},
@@ -153,7 +134,7 @@ def test_value_validation():
     ]
 
     with pytest.raises(ValidationError) as exc_info:
-        Response[Dict[int, int]](data={1: 3, 2: 6})
+        Response[dict[int, int]](data={1: 3, 2: 6})
     assert exc_info.value.errors(include_url=False) == [
         {
             'ctx': {'error': HasRepr(repr(ValueError('sum too large')))},
@@ -181,8 +162,7 @@ def test_methods_are_inherited():
 
 
 def test_config_is_inherited():
-    class CustomGenericModel(BaseModel, frozen=True):
-        ...
+    class CustomGenericModel(BaseModel, frozen=True): ...
 
     T = TypeVar('T')
 
@@ -300,6 +280,20 @@ def test_subclass_can_be_genericized():
     Result[T]
 
 
+def test_type_var_default_referencing_other_type_var() -> None:
+    # Example taken from:
+    # https://typing.readthedocs.io/en/latest/spec/generics.html#type-parameters-as-parameters-to-generics
+
+    T = TypeVar('T')
+    ListDefaultT = TypingExtensionsTypeVar('ListDefaultT', default=list[T])
+
+    class Model(BaseModel, Generic[T, ListDefaultT]):
+        t: T
+        ls: ListDefaultT
+
+    assert Model[int].__pydantic_generic_metadata__['args'] == (int, list[int])
+
+
 def test_parameter_count():
     T = TypeVar('T')
     S = TypeVar('S')
@@ -313,14 +307,38 @@ def test_parameter_count():
 
     # This error message, which comes from `typing`, changed 'parameters' to 'arguments' in 3.11
     error_message = str(exc_info.value)
-    assert error_message.startswith('Too many parameters') or error_message.startswith('Too many arguments')
+    assert error_message.startswith(('Too many parameters', 'Too many arguments'))
     assert error_message.endswith(
         " for <class 'tests.test_generics.test_parameter_count.<locals>.Model'>; actual 3, expected 2"
     )
 
 
-def test_cover_cache(clean_cache):
-    cache_size = len(_GENERIC_TYPES_CACHE)
+def test_arguments_count_validation() -> None:
+    T = TypeVar('T')
+    U = TypeVar('U')
+    V = TypingExtensionsTypeVar('V', default=int)
+
+    class Model(BaseModel, Generic[T, U, V]):
+        t: T
+        u: U
+        v: V
+
+    model_repr = repr(Model)
+
+    with pytest.raises(TypeError, match=f'Too many arguments for {model_repr}; actual 4, expected 3'):
+        Model[int, int, int, int]
+
+    with pytest.raises(TypeError, match=f'Too few arguments for {model_repr}; actual 1, expected at least 2'):
+        Model[int]
+
+    assert Model[int, int].__pydantic_generic_metadata__['args'] == (int, int, int)
+    assert Model[int, int, str].__pydantic_generic_metadata__['args'] == (int, int, str)
+
+
+@pytest.mark.thread_unsafe(reason='testing behaviour of global cache')
+def test_cover_cache(mocker: MockerFixture):
+    cache = mocker.patch('pydantic._internal._generics._GENERIC_TYPES_CACHE', GenericTypesCache())
+    cache_size = len(cache)
     T = TypeVar('T')
 
     class Model(BaseModel, Generic[T]):
@@ -329,16 +347,17 @@ def test_cover_cache(clean_cache):
     models = []  # keep references to models to get cache size
 
     models.append(Model[int])  # adds both with-tuple and without-tuple version to cache
-    assert len(_GENERIC_TYPES_CACHE) == cache_size + 3
+    assert len(cache) == cache_size + 3
     models.append(Model[int])  # uses the cache
-    assert len(_GENERIC_TYPES_CACHE) == cache_size + 3
+    assert len(cache) == cache_size + 3
     del models
 
 
-def test_cache_keys_are_hashable(clean_cache):
-    cache_size = len(_GENERIC_TYPES_CACHE)
+def test_cache_keys_are_hashable(mocker: MockerFixture):
+    cache = mocker.patch('pydantic._internal._generics._GENERIC_TYPES_CACHE', GenericTypesCache())
+    cache_size = len(cache)
     T = TypeVar('T')
-    C = Callable[[str, Dict[str, Any]], Iterable[str]]
+    C = Callable[[str, dict[str, Any]], Iterable[str]]
 
     class MyGenericModel(BaseModel, Generic[T]):
         t: T
@@ -349,26 +368,28 @@ def test_cache_keys_are_hashable(clean_cache):
     models = []  # keep references to models to get cache size
     models.append(Simple)
 
-    assert len(_GENERIC_TYPES_CACHE) == cache_size + 3
+    assert len(cache) == cache_size + 3
     # Nested Callables
     models.append(MyGenericModel[Callable[[C], Iterable[str]]])
-    assert len(_GENERIC_TYPES_CACHE) == cache_size + 6
+    assert len(cache) == cache_size + 6
     models.append(MyGenericModel[Callable[[Simple], Iterable[int]]])
-    assert len(_GENERIC_TYPES_CACHE) == cache_size + 9
+    assert len(cache) == cache_size + 9
     models.append(MyGenericModel[Callable[[MyGenericModel[C]], Iterable[int]]])
-    assert len(_GENERIC_TYPES_CACHE) == cache_size + 15
+    assert len(cache) == cache_size + 15
 
     class Model(BaseModel):
-        x: MyGenericModel[Callable[[C], Iterable[str]]] = Field(...)
+        x: MyGenericModel[Callable[[C], Iterable[str]]]
 
     models.append(Model)
-    assert len(_GENERIC_TYPES_CACHE) == cache_size + 15
+    assert len(cache) == cache_size + 15
     del models
 
 
+@pytest.mark.thread_unsafe(reason='GC is flaky')
 @pytest.mark.skipif(platform.python_implementation() == 'PyPy', reason='PyPy does not play nice with PyO3 gc')
-def test_caches_get_cleaned_up(clean_cache):
-    initial_types_cache_size = len(_GENERIC_TYPES_CACHE)
+def test_caches_get_cleaned_up(mocker: MockerFixture):
+    cache = mocker.patch('pydantic._internal._generics._GENERIC_TYPES_CACHE', GenericTypesCache())
+    initial_types_cache_size = len(cache)
     T = TypeVar('T')
 
     class MyGenericModel(BaseModel, Generic[T]):
@@ -385,17 +406,18 @@ def test_caches_get_cleaned_up(clean_cache):
 
         types.append(MyGenericModel[MyType])  # retain a reference
 
-    assert len(_GENERIC_TYPES_CACHE) == initial_types_cache_size + 3 * n_types
+    assert len(cache) == initial_types_cache_size + 3 * n_types
     types.clear()
     gc.collect(0)
     gc.collect(1)
     gc.collect(2)
-    assert len(_GENERIC_TYPES_CACHE) < initial_types_cache_size + _LIMITED_DICT_SIZE
+    assert len(cache) < initial_types_cache_size + _LIMITED_DICT_SIZE
 
 
 @pytest.mark.skipif(platform.python_implementation() == 'PyPy', reason='PyPy does not play nice with PyO3 gc')
-def test_caches_get_cleaned_up_with_aliased_parametrized_bases(clean_cache):
-    types_cache_size = len(_GENERIC_TYPES_CACHE)
+def test_caches_get_cleaned_up_with_aliased_parametrized_bases(mocker: MockerFixture):
+    cache = mocker.patch('pydantic._internal._generics._GENERIC_TYPES_CACHE', GenericTypesCache())
+    types_cache_size = len(cache)
 
     def run() -> None:  # Run inside nested function to get classes in local vars cleaned also
         T1 = TypeVar('T1')
@@ -407,7 +429,7 @@ def test_caches_get_cleaned_up_with_aliased_parametrized_bases(clean_cache):
 
         B = A[int, T2]
         C = B[str]
-        assert len(_GENERIC_TYPES_CACHE) == types_cache_size + 5
+        assert len(cache) == types_cache_size + 5
         del C
         del B
         gc.collect()
@@ -417,13 +439,14 @@ def test_caches_get_cleaned_up_with_aliased_parametrized_bases(clean_cache):
     gc.collect(0)
     gc.collect(1)
     gc.collect(2)
-    assert len(_GENERIC_TYPES_CACHE) < types_cache_size + _LIMITED_DICT_SIZE
+    assert len(cache) < types_cache_size + _LIMITED_DICT_SIZE
 
 
+@pytest.mark.thread_unsafe(reason='GC is flaky')
 @pytest.mark.skipif(platform.python_implementation() == 'PyPy', reason='PyPy does not play nice with PyO3 gc')
-@pytest.mark.skipif(sys.version_info[:2] == (3, 9), reason='The test randomly fails on Python 3.9')
-def test_circular_generic_refs_get_cleaned_up():
-    initial_cache_size = len(_GENERIC_TYPES_CACHE)
+def test_circular_generic_refs_get_cleaned_up(mocker: MockerFixture):
+    cache = mocker.patch('pydantic._internal._generics._GENERIC_TYPES_CACHE', GenericTypesCache())
+    initial_cache_size = len(cache)
 
     def fn():
         T = TypeVar('T')
@@ -437,8 +460,8 @@ def test_circular_generic_refs_get_cleaned_up():
             c: Inner[int, C]
 
         klass = Outer[str]
-        assert len(_GENERIC_TYPES_CACHE) > initial_cache_size
-        assert klass in _GENERIC_TYPES_CACHE.values()
+        assert len(cache) > initial_cache_size
+        assert klass in cache.values()
 
     fn()
 
@@ -446,11 +469,12 @@ def test_circular_generic_refs_get_cleaned_up():
     gc.collect(1)
     gc.collect(2)
 
-    assert len(_GENERIC_TYPES_CACHE) == initial_cache_size
+    assert len(cache) == initial_cache_size
 
 
-def test_generics_work_with_many_parametrized_base_models(clean_cache):
-    cache_size = len(_GENERIC_TYPES_CACHE)
+def test_generics_work_with_many_parametrized_base_models(mocker: MockerFixture):
+    cache = mocker.patch('pydantic._internal._generics._GENERIC_TYPES_CACHE', GenericTypesCache())
+    cache_size = len(cache)
     count_create_models = 1000
     T = TypeVar('T')
     C = TypeVar('C')
@@ -477,9 +501,40 @@ def test_generics_work_with_many_parametrized_base_models(clean_cache):
         generics.append(Working)
 
     target_size = cache_size + count_create_models * 3 + 2
-    assert len(_GENERIC_TYPES_CACHE) < target_size + _LIMITED_DICT_SIZE
+    assert len(cache) < target_size + _LIMITED_DICT_SIZE
     del models
     del generics
+
+
+def test_generics_reused() -> None:
+    """https://github.com/pydantic/pydantic/issues/11747
+
+    To fix an issue with recursive generics, we introduced a change in 2.11 that would
+    skip caching the parameterized model under specific circumstances. The following setup
+    is an example of where this would happen. As a result, we ended up with two different `A[int]`
+    classes, although they were the same in practice.
+    When serializing, we check that the value instances are matching the type, but we ended up
+    with warnings as `isinstance(value, A[int])` fails.
+    The fix was reverted as a refactor (https://github.com/pydantic/pydantic/pull/11388) fixed
+    the underlying issue.
+    """
+
+    T = TypeVar('T')
+
+    class A(BaseModel, Generic[T]):
+        pass
+
+    class B(BaseModel, Generic[T]):
+        pass
+
+    AorB = TypeAliasType('AorB', A[T] | B[T], type_params=(T,))
+
+    class Main(BaseModel, Generic[T]):
+        ls: list[AorB[T]] = []
+
+    m = Main[int]()
+    m.ls.append(A[int]())
+    m.model_dump_json(warnings='error')
 
 
 def test_generic_config():
@@ -513,13 +568,13 @@ def test_generic():
     error_type = TypeVar('error_type')
 
     class Result(BaseModel, Generic[data_type, error_type]):
-        data: Optional[List[data_type]] = None
-        error: Optional[error_type] = None
+        data: list[data_type] | None = None
+        error: error_type | None = None
         positive_number: int
 
         @field_validator('error')
         @classmethod
-        def validate_error(cls, v: Optional[error_type], info: ValidationInfo) -> Optional[error_type]:
+        def validate_error(cls, v: error_type | None, info: ValidationInfo) -> error_type | None:
             values = info.data
             if values.get('data', None) is None and v is None:
                 raise ValueError('Must provide data or error')
@@ -584,7 +639,7 @@ def test_alongside_concrete_generics():
 
     class MyModel(BaseModel, Generic[T]):
         item: T
-        metadata: Dict[str, Any]
+        metadata: dict[str, Any]
 
     model = MyModel[int](item=1, metadata={})
     assert model.item == 1
@@ -595,7 +650,7 @@ def test_complex_nesting():
     T = TypeVar('T')
 
     class MyModel(BaseModel, Generic[T]):
-        item: List[Dict[Union[int, T], str]]
+        item: list[dict[int | T, str]]
 
     item = [{1: 'a', 'a': 'a'}]
     model = MyModel[str](item=item)
@@ -619,7 +674,7 @@ def test_optional_value():
     T = TypeVar('T')
 
     class MyModel(BaseModel, Generic[T]):
-        a: Optional[int] = 1
+        a: int | None = 1
 
     model = MyModel[int]()
     assert model.model_dump() == {'a': 1}
@@ -657,10 +712,10 @@ def test_custom_generic_naming():
     T = TypeVar('T')
 
     class MyModel(BaseModel, Generic[T]):
-        value: Optional[T]
+        value: T | None
 
         @classmethod
-        def model_parametrized_name(cls, params: Tuple[Type[Any], ...]) -> str:
+        def model_parametrized_name(cls, params: tuple[type[Any], ...]) -> str:
             param_names = [param.__name__ if hasattr(param, '__name__') else str(param) for param in params]
             title = param_names[0].title()
             return f'Optional{title}Wrapper'
@@ -686,10 +741,7 @@ def test_nested():
     OuterT_SameType[int](i={'a': 8})
     OuterT_SameType[int](i=inner_int)
     OuterT_SameType[str](i=inner_str)
-    # TODO: The next line is failing, but passes in v1.
-    #   Should re-parse-from-dict if the pydantic_generic_origin is the same
-    # OuterT_SameType[str](i=inner_int_any)
-    OuterT_SameType[int](i=inner_int_any.model_dump())
+    OuterT_SameType[int](i=inner_int_any)
 
     with pytest.raises(ValidationError) as exc_info:
         OuterT_SameType[int](i=inner_str.model_dump())
@@ -707,11 +759,10 @@ def test_nested():
     # insert_assert(exc_info.value.errors(include_url=False))
     assert exc_info.value.errors(include_url=False) == [
         {
-            'type': 'model_type',
-            'loc': ('i',),
-            'msg': 'Input should be a valid dictionary or instance of InnerT[int]',
-            'input': InnerT[str](a='ate'),
-            'ctx': {'class_name': 'InnerT[int]'},
+            'type': 'int_parsing',
+            'loc': ('i', 'a'),
+            'msg': 'Input should be a valid integer, unable to parse string as an integer',
+            'input': 'ate',
         }
     ]
 
@@ -725,13 +776,7 @@ def test_nested():
         OuterT_SameType[int](i=inner_dict_any)
     # insert_assert(exc_info.value.errors(include_url=False))
     assert exc_info.value.errors(include_url=False) == [
-        {
-            'type': 'model_type',
-            'loc': ('i',),
-            'msg': 'Input should be a valid dictionary or instance of InnerT[int]',
-            'input': InnerT[Any](a={}),
-            'ctx': {'class_name': 'InnerT[int]'},
-        }
+        {'type': 'int_type', 'loc': ('i', 'a'), 'msg': 'Input should be a valid integer', 'input': {}}
     ]
 
 
@@ -764,8 +809,8 @@ def test_partial_specification_with_inner_typevar():
     BT = TypeVar('BT')
 
     class Model(BaseModel, Generic[AT, BT]):
-        a: List[AT]
-        b: List[BT]
+        a: list[AT]
+        b: list[BT]
 
     partial_model = Model[int, BT]
     assert partial_model.__pydantic_generic_metadata__['parameters']
@@ -977,6 +1022,78 @@ def test_generic_model_from_function_pickle_fail(create_module):
             pickle.dumps(original)
 
 
+@pytest.mark.skipif(
+    sys.platform == 'emscripten' or platform.python_implementation() == 'PyPy',
+    reason='no subprocesses on emscripten and PyPy pickle issue',
+)
+def test_generic_model_pickle_different_module(tmp_path) -> None:
+    """https://github.com/pydantic/pydantic/issues/9390#issuecomment-4561654742
+
+    This can't be reliably tested using the `create_module` fixture, so use subprocesses instead.
+    """
+
+    tmp_path.joinpath('module.py').write_text(
+        dedent(
+            """
+            from typing import Generic, TypeVar
+
+            from pydantic import BaseModel
+
+            T = TypeVar("T")
+
+            class Model(BaseModel, Generic[T]):
+                value: T
+            """
+        )
+    )
+
+    creator_code = dedent(
+        f"""
+        import base64
+        import sys
+
+        import cloudpickle
+
+        sys.path.insert(0, {str(tmp_path)!r})
+        from module import Model
+
+        value = Model[int](value=5)
+        print(base64.b64encode(cloudpickle.dumps(value, protocol=5)).decode())
+        """
+    )
+
+    creator = subprocess.run(
+        [sys.executable, '-c', creator_code],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    payload = creator.stdout.splitlines()[0]
+
+    loader_code = dedent(
+        f"""
+        import base64
+        import sys
+
+        import cloudpickle
+
+        sys.path.insert(0, {str(tmp_path)!r})
+
+        print(cloudpickle.loads(base64.b64decode({payload!r})))
+        """
+    )
+
+    loader = subprocess.run(
+        [sys.executable, '-c', loader_code],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert loader.stdout.rstrip() == 'value=5'
+
+
 def test_generic_model_redefined_without_cache_fail(create_module, monkeypatch):
     # match identity checker otherwise we never get to the redefinition check
     monkeypatch.setattr('pydantic._internal._utils.all_identical', lambda left, right: False)
@@ -993,11 +1110,10 @@ def test_generic_model_redefined_without_cache_fail(create_module, monkeypatch):
         class MyGeneric(BaseModel, Generic[t]):
             value: t
 
-        class Model(BaseModel):
-            ...
+        class Model(BaseModel): ...
 
         concrete = MyGeneric[Model]
-        _GENERIC_TYPES_CACHE.clear()
+        _GENERIC_TYPES_CACHE.clear()  # pyright: ignore[reportOptionalMemberAccess], guaranteed to be set
         second_concrete = MyGeneric[Model]
 
         class Model(BaseModel):  # same name, but type different, so it's not in cache
@@ -1025,8 +1141,8 @@ def test_generic_model_caching_detect_order_of_union_args_basic(create_module):
         class Model(BaseModel, Generic[t]):
             data: t
 
-        int_or_float_model = Model[Union[int, float]]
-        float_or_int_model = Model[Union[float, int]]
+        int_or_float_model = Model[Union[int, float]]  # noqa: UP007
+        float_or_int_model = Model[Union[float, int]]  # noqa: UP007
 
         assert type(int_or_float_model(data='1').data) is int
         assert type(float_or_int_model(data='1').data) is float
@@ -1042,7 +1158,7 @@ def test_generic_model_caching_detect_order_of_union_args_nested(create_module):
     # Nested variant of https://github.com/pydantic/pydantic/issues/4474
     @create_module
     def module():
-        from typing import Generic, List, TypeVar, Union
+        from typing import Generic, TypeVar
 
         from pydantic import BaseModel
 
@@ -1051,8 +1167,8 @@ def test_generic_model_caching_detect_order_of_union_args_nested(create_module):
         class Model(BaseModel, Generic[t]):
             data: t
 
-        int_or_float_model = Model[List[Union[int, float]]]
-        float_or_int_model = Model[List[Union[float, int]]]
+        int_or_float_model = Model[list[int | float]]
+        float_or_int_model = Model[list[float | int]]
 
         assert type(int_or_float_model(data=['1']).data[0]) is int
         assert type(float_or_int_model(data=['1']).data[0]) is float
@@ -1092,6 +1208,7 @@ def test_get_caller_frame_info_called_from_module(create_module):
                 _get_caller_frame_info()
 
 
+@pytest.mark.thread_unsafe(reason='Deleting built-in functions')
 def test_get_caller_frame_info_when_sys_getframe_undefined():
     from pydantic._internal._generics import _get_caller_frame_info
 
@@ -1111,9 +1228,9 @@ def test_iter_contained_typevars():
         a: T
 
     assert list(iter_contained_typevars(Model[T])) == [T]
-    assert list(iter_contained_typevars(Optional[List[Union[str, Model[T]]]])) == [T]
-    assert list(iter_contained_typevars(Optional[List[Union[str, Model[int]]]])) == []
-    assert list(iter_contained_typevars(Optional[List[Union[str, Model[T], Callable[[T2, T], str]]]])) == [T, T2, T]
+    assert list(iter_contained_typevars(Optional[list[str | Model[T]]])) == [T]  # noqa: UP045
+    assert list(iter_contained_typevars(list[str | Model[int]] | None)) == []
+    assert list(iter_contained_typevars(list[str | Model[T] | Callable[[T2, T], str]] | None)) == [T, T2, T]
 
 
 def test_nested_identity_parameterization():
@@ -1135,30 +1252,28 @@ def test_replace_types():
         a: T
 
     assert replace_types(T, {T: int}) is int
-    assert replace_types(List[Union[str, list, T]], {T: int}) == List[Union[str, list, int]]
+    assert replace_types(list[str | list | T], {T: int}) == list[str | list | int]
     assert replace_types(Callable, {T: int}) == Callable
     assert replace_types(Callable[[int, str, T], T], {T: int}) == Callable[[int, str, int], int]
     assert replace_types(T, {}) is T
-    assert replace_types(Model[List[T]], {T: int}) == Model[List[int]]
-    assert replace_types(Model[List[T]], {T: int}) == Model[List[T]][int]
+    assert replace_types(Model[list[T]], {T: int}) == Model[list[int]]
+    assert replace_types(Model[list[T]], {T: int}) == Model[list[T]][int]
     assert (
-        replace_types(Model[List[T]], {T: int}).model_fields['a'].annotation
-        == Model[List[T]][int].model_fields['a'].annotation
+        replace_types(Model[list[T]], {T: int}).model_fields['a'].annotation
+        == Model[list[T]][int].model_fields['a'].annotation
     )
     assert replace_types(T, {}) is T
-    assert replace_types(Type[T], {T: int}) == Type[int]
+    assert replace_types(type[T], {T: int}) == type[int]
     assert replace_types(Model[T], {T: T}) == Model[T]
     assert replace_types(Json[T], {T: int}) == Json[int]
 
-    if sys.version_info >= (3, 9):
-        # Check generic aliases (subscripted builtin types) to make sure they
-        # resolve correctly (don't get translated to typing versions for
-        # example)
-        assert replace_types(list[Union[str, list, T]], {T: int}) == list[Union[str, list, int]]
+    # Check generic aliases (subscripted builtin types) to make sure they
+    # resolve correctly (don't get translated to typing versions for
+    # example)
+    assert replace_types(list[str | list | T], {T: int}) == list[str | list | int]
 
-    if sys.version_info >= (3, 10):
-        # Check that types.UnionType gets handled properly
-        assert replace_types(str | list[T] | float, {T: int}) == str | list[int] | float
+    # Check that types.UnionType gets handled properly
+    assert replace_types(str | list[T] | float, {T: int}) == str | list[int] | float
 
 
 def test_replace_types_with_user_defined_generic_type_field():  # noqa: C901
@@ -1172,29 +1287,29 @@ def test_replace_types_with_user_defined_generic_type_field():  # noqa: C901
         def __get_pydantic_core_schema__(cls, source_type: Any, handler: GetCoreSchemaHandler) -> CoreSchema:
             return core_schema.no_info_after_validator_function(cls, handler(Counter[get_args(source_type)[0]]))
 
-    class CustomDefaultDict(DefaultDict[KT, VT]):
+    class CustomDefaultDict(defaultdict[KT, VT]):
         @classmethod
         def __get_pydantic_core_schema__(cls, source_type: Any, handler: GetCoreSchemaHandler) -> CoreSchema:
             keys_type, values_type = get_args(source_type)
             return core_schema.no_info_after_validator_function(
-                lambda x: cls(x.default_factory, x), handler(DefaultDict[keys_type, values_type])
+                lambda x: cls(x.default_factory, x), handler(defaultdict[keys_type, values_type])
             )
 
-    class CustomDeque(Deque[T]):
+    class CustomDeque(deque[T]):
         @classmethod
         def __get_pydantic_core_schema__(cls, source_type: Any, handler: GetCoreSchemaHandler) -> CoreSchema:
-            return core_schema.no_info_after_validator_function(cls, handler(Deque[get_args(source_type)[0]]))
+            return core_schema.no_info_after_validator_function(cls, handler(deque[get_args(source_type)[0]]))
 
-    class CustomDict(Dict[KT, VT]):
+    class CustomDict(dict[KT, VT]):
         @classmethod
         def __get_pydantic_core_schema__(cls, source_type: Any, handler: GetCoreSchemaHandler) -> CoreSchema:
             keys_type, values_type = get_args(source_type)
-            return core_schema.no_info_after_validator_function(cls, handler(Dict[keys_type, values_type]))
+            return core_schema.no_info_after_validator_function(cls, handler(dict[keys_type, values_type]))
 
-    class CustomFrozenset(FrozenSet[T]):
+    class CustomFrozenset(frozenset[T]):
         @classmethod
         def __get_pydantic_core_schema__(cls, source_type: Any, handler: GetCoreSchemaHandler) -> CoreSchema:
-            return core_schema.no_info_after_validator_function(cls, handler(FrozenSet[get_args(source_type)[0]]))
+            return core_schema.no_info_after_validator_function(cls, handler(frozenset[get_args(source_type)[0]]))
 
     class CustomIterable(Iterable[T]):
         def __init__(self, iterable):
@@ -1210,10 +1325,10 @@ def test_replace_types_with_user_defined_generic_type_field():  # noqa: C901
         def __get_pydantic_core_schema__(cls, source_type: Any, handler: GetCoreSchemaHandler) -> CoreSchema:
             return core_schema.no_info_after_validator_function(cls, handler(Iterable[get_args(source_type)[0]]))
 
-    class CustomList(List[T]):
+    class CustomList(list[T]):
         @classmethod
         def __get_pydantic_core_schema__(cls, source_type: Any, handler: GetCoreSchemaHandler) -> CoreSchema:
-            return core_schema.no_info_after_validator_function(cls, handler(List[get_args(source_type)[0]]))
+            return core_schema.no_info_after_validator_function(cls, handler(list[get_args(source_type)[0]]))
 
     class CustomMapping(Mapping[KT, VT]):
         @classmethod
@@ -1227,20 +1342,20 @@ def test_replace_types_with_user_defined_generic_type_field():  # noqa: C901
             keys_type, values_type = get_args(source_type)
             return core_schema.no_info_after_validator_function(cls, handler(OrderedDict[keys_type, values_type]))
 
-    class CustomSet(Set[T]):
+    class CustomSet(set[T]):
         @classmethod
         def __get_pydantic_core_schema__(cls, source_type: Any, handler: GetCoreSchemaHandler) -> CoreSchema:
-            return core_schema.no_info_after_validator_function(cls, handler(Set[get_args(source_type)[0]]))
+            return core_schema.no_info_after_validator_function(cls, handler(set[get_args(source_type)[0]]))
 
-    class CustomTuple(Tuple[T]):
+    class CustomTuple(tuple[T]):
         @classmethod
         def __get_pydantic_core_schema__(cls, source_type: Any, handler: GetCoreSchemaHandler) -> CoreSchema:
-            return core_schema.no_info_after_validator_function(cls, handler(Tuple[get_args(source_type)[0]]))
+            return core_schema.no_info_after_validator_function(cls, handler(tuple[get_args(source_type)[0]]))
 
-    class CustomLongTuple(Tuple[T, VT]):
+    class CustomLongTuple(tuple[T, VT]):
         @classmethod
         def __get_pydantic_core_schema__(cls, source_type: Any, handler: GetCoreSchemaHandler) -> CoreSchema:
-            return core_schema.no_info_after_validator_function(cls, handler(Tuple[get_args(source_type)]))
+            return core_schema.no_info_after_validator_function(cls, handler(tuple[get_args(source_type)]))
 
     class Model(BaseModel, Generic[T, KT, VT]):
         counter_field: CustomCounter[T]
@@ -1329,7 +1444,7 @@ def test_replace_types_identity_on_unchanged():
     T = TypeVar('T')
     U = TypeVar('U')
 
-    type_ = List[Union[str, Callable[[list], Optional[str]], U]]
+    type_ = list[str | Callable[[list], str | None] | U]
     assert replace_types(type_, {T: int}) is type_
 
 
@@ -1339,8 +1454,8 @@ def test_deep_generic():
     R = TypeVar('R')
 
     class OuterModel(BaseModel, Generic[T, S, R]):
-        a: Dict[R, Optional[List[T]]]
-        b: Optional[Union[S, R]]
+        a: dict[R, list[T] | None]
+        b: S | R | None
         c: R
         d: float
 
@@ -1368,7 +1483,7 @@ def test_deep_generic_with_inner_typevar():
     T = TypeVar('T')
 
     class OuterModel(BaseModel, Generic[T]):
-        a: List[T]
+        a: list[T]
 
     class InnerModel(OuterModel[T], Generic[T]):
         pass
@@ -1409,7 +1524,7 @@ def test_deep_generic_with_referenced_inner_generic():
         a: T
 
     class OuterModel(BaseModel, Generic[T]):
-        a: Optional[List[Union[ReferencedModel[T], str]]]
+        a: list[ReferencedModel[T] | str] | None
 
     class InnerModel(OuterModel[T], Generic[T]):
         pass
@@ -1419,9 +1534,9 @@ def test_deep_generic_with_referenced_inner_generic():
 
     with pytest.raises(ValidationError):
         InnerModel[int](a=['s', {'a': 'wrong'}])
-    assert InnerModel[int](a=['s', {'a': 1}]).a[1].a == 1
 
-    assert InnerModel[int].model_fields['a'].annotation == Optional[List[Union[ReferencedModel[int], str]]]
+    assert InnerModel[int](a=['s', {'a': 1}]).a[1].a == 1
+    assert InnerModel[int].model_fields['a'].annotation == list[ReferencedModel[int] | str] | None
 
 
 def test_deep_generic_with_multiple_typevars():
@@ -1429,14 +1544,14 @@ def test_deep_generic_with_multiple_typevars():
     U = TypeVar('U')
 
     class OuterModel(BaseModel, Generic[T]):
-        data: List[T]
+        data: list[T]
 
     class InnerModel(OuterModel[T], Generic[U, T]):
         extra: U
 
     ConcreteInnerModel = InnerModel[int, float]
 
-    assert ConcreteInnerModel.model_fields['data'].annotation == List[float]
+    assert ConcreteInnerModel.model_fields['data'].annotation == list[float]
     assert ConcreteInnerModel.model_fields['extra'].annotation == int
 
     assert ConcreteInnerModel(data=['1'], extra='2').model_dump() == {'data': [1.0], 'extra': 2}
@@ -1448,18 +1563,18 @@ def test_deep_generic_with_multiple_inheritance():
     T = TypeVar('T')
 
     class OuterModelA(BaseModel, Generic[K, V]):
-        data: Dict[K, V]
+        data: dict[K, V]
 
     class OuterModelB(BaseModel, Generic[T]):
-        stuff: List[T]
+        stuff: list[T]
 
     class InnerModel(OuterModelA[K, V], OuterModelB[T], Generic[K, V, T]):
         extra: int
 
     ConcreteInnerModel = InnerModel[int, float, str]
 
-    assert ConcreteInnerModel.model_fields['data'].annotation == Dict[int, float]
-    assert ConcreteInnerModel.model_fields['stuff'].annotation == List[str]
+    assert ConcreteInnerModel.model_fields['data'].annotation == dict[int, float]
+    assert ConcreteInnerModel.model_fields['stuff'].annotation == list[str]
     assert ConcreteInnerModel.model_fields['extra'].annotation == int
 
     with pytest.raises(ValidationError) as exc_info:
@@ -1487,7 +1602,7 @@ def test_generic_with_referenced_generic_type_1():
     class ModelWithType(BaseModel, Generic[T]):
         # Type resolves to type origin of "type" which is non-subscriptible for
         # python < 3.9 so we want to make sure it works for other versions
-        some_type: Type[T]
+        some_type: type[T]
 
     class ReferenceModel(BaseModel, Generic[T]):
         abstract_base_with_type: ModelWithType[T]
@@ -1499,30 +1614,25 @@ def test_generic_with_referenced_generic_type_bound():
     T = TypeVar('T', bound=int)
 
     class ModelWithType(BaseModel, Generic[T]):
-        # Type resolves to type origin of "type" which is non-subscriptible for
-        # python < 3.9 so we want to make sure it works for other versions
-        some_type: Type[T]
+        some_type: type[T]
 
     class ReferenceModel(BaseModel, Generic[T]):
         abstract_base_with_type: ModelWithType[T]
 
-    class MyInt(int):
-        ...
+    class MyInt(int): ...
 
     ReferenceModel[MyInt]
 
 
 def test_generic_with_referenced_generic_union_type_bound():
-    T = TypeVar('T', bound=Union[str, int])
+    T = TypeVar('T', bound=str | int)
 
     class ModelWithType(BaseModel, Generic[T]):
-        some_type: Type[T]
+        some_type: type[T]
 
-    class MyInt(int):
-        ...
+    class MyInt(int): ...
 
-    class MyStr(str):
-        ...
+    class MyStr(str): ...
 
     ModelWithType[MyInt]
     ModelWithType[MyStr]
@@ -1532,9 +1642,7 @@ def test_generic_with_referenced_generic_type_constraints():
     T = TypeVar('T', int, str)
 
     class ModelWithType(BaseModel, Generic[T]):
-        # Type resolves to type origin of "type" which is non-subscriptible for
-        # python < 3.9 so we want to make sure it works for other versions
-        some_type: Type[T]
+        some_type: type[T]
 
     class ReferenceModel(BaseModel, Generic[T]):
         abstract_base_with_type: ModelWithType[T]
@@ -1562,7 +1670,7 @@ def test_generic_with_callable():
 
     class Model(BaseModel, Generic[T]):
         # Callable is a test for any type that accepts a list as an argument
-        some_callable: Callable[[Optional[int], T], None]
+        some_callable: Callable[[int | None, T], None]
 
     assert not Model[str].__pydantic_generic_metadata__['parameters']
     assert Model.__pydantic_generic_metadata__['parameters']
@@ -1576,7 +1684,7 @@ def test_generic_with_partial_callable():
         t: T
         u: U
         # Callable is a test for any type that accepts a list as an argument
-        some_callable: Callable[[Optional[int], str], None]
+        some_callable: Callable[[int | None, str], None]
 
     assert Model[str, U].__pydantic_generic_metadata__['parameters'] == (U,)
     assert not Model[str, int].__pydantic_generic_metadata__['parameters']
@@ -1585,7 +1693,7 @@ def test_generic_with_partial_callable():
 def test_generic_recursive_models(create_module):
     @create_module
     def module():
-        from typing import Generic, TypeVar, Union
+        from typing import Generic, TypeVar
 
         from pydantic import BaseModel
 
@@ -1595,7 +1703,7 @@ def test_generic_recursive_models(create_module):
             ref: 'Model2[T]'
 
         class Model2(BaseModel, Generic[T]):
-            ref: Union[T, Model1[T]]
+            ref: T | Model1[T]
 
         Model1.model_rebuild()
 
@@ -1633,10 +1741,92 @@ def test_generic_recursive_models(create_module):
     assert result.model_dump() == {'ref': {'ref': {'ref': {'ref': '123'}}}}
 
 
+def test_generic_recursive_models_parametrized() -> None:
+    """https://github.com/pydantic/pydantic/issues/10279"""
+
+    # This test is similar (if not identical) to the previous one, although in this one,
+    # we make sure we can parametrize and rebuild the models (see the linked issue).
+
+    T = TypeVar('T')
+
+    class Model1(BaseModel, Generic[T]):
+        model2: 'Model2[T]'
+
+    S = TypeVar('S')
+
+    class Model2(BaseModel, Generic[S]):
+        model1: Model1[S]
+
+    Model1[str].model_rebuild()
+    Model2[str].model_rebuild()
+
+
+def test_generic_recursive_models_parametrized_with_model() -> None:
+    """https://github.com/pydantic/pydantic/issues/11748"""
+
+    T = TypeVar('T')
+
+    class Base(BaseModel, Generic[T]):
+        t: T
+
+    class Other(BaseModel):
+        child: 'Base[Other] | None'
+
+    with pytest.raises(ValidationError):
+        # In v2.0-2.10, this unexpectedly validated fine (The core schema of Base[Other].t was an empty model).
+        # Since v2.11, building `Other` raised an unhandled exception.
+        # Now, it works as expected.
+        Base[Other].model_validate({'t': {}})
+
+    Base[Other].model_validate({'t': {'child': {'t': {'child': None}}}})
+
+
+def test_generic_recursive_models_parametrized_with_model_subclass() -> None:
+    """https://github.com/pydantic/pydantic/issues/12396.
+
+    Follow up on `test_generic_recursive_models_parametrized_with_model()`.
+    """
+
+    # The code to check if `__pydantic_fields__` was set was wrongly
+    # checking for parent classes as well (and not in the class' `__dict__`):
+    class MyBaseModel(BaseModel):
+        pass
+
+    T = TypeVar('T')
+
+    class Base(MyBaseModel, Generic[T]):
+        t: T
+
+    class Other(MyBaseModel):
+        child: 'Base[Other] | None'
+
+    with pytest.raises(ValidationError):
+        Base[Other].model_validate({'t': {}})
+
+    Base[Other].model_validate({'t': {'child': {'t': {'child': None}}}})
+
+
+@pytest.mark.xfail(reason='Core schema generation is missing the M1 definition')
+def test_generic_recursive_models_inheritance() -> None:
+    """https://github.com/pydantic/pydantic/issues/9969"""
+
+    T = TypeVar('T')
+
+    class M1(BaseModel, Generic[T]):
+        bar: 'M1[T]'
+
+    class M2(M1[str]):
+        pass
+
+    M2.model_rebuild()
+
+    assert M2.__pydantic_complete__
+
+
 def test_generic_recursive_models_separate_parameters(create_module):
     @create_module
     def module():
-        from typing import Generic, TypeVar, Union
+        from typing import Generic, TypeVar
 
         from pydantic import BaseModel
 
@@ -1648,7 +1838,7 @@ def test_generic_recursive_models_separate_parameters(create_module):
         S = TypeVar('S')
 
         class Model2(BaseModel, Generic[S]):
-            ref: Union[S, Model1[S]]
+            ref: S | Model1[S]
 
         Model1.model_rebuild()
 
@@ -1711,8 +1901,8 @@ def test_generic_recursive_models_repeated_separate_parameters(create_module):
         S = TypeVar('S')
 
         class Model2(BaseModel, Generic[S]):
-            ref: Union[S, Model1[S]]
-            ref2: Union[S, Model1[S], None] = None
+            ref: S | Model1[S]
+            ref2: S | Model1[S] | None = None
 
         Model1.model_rebuild()
 
@@ -1795,7 +1985,7 @@ def test_generic_recursive_models_triple(create_module):
 def test_generic_recursive_models_with_a_concrete_parameter(create_module):
     @create_module
     def module():
-        from typing import Generic, TypeVar, Union
+        from typing import Generic, TypeVar
 
         from pydantic import BaseModel
 
@@ -1805,17 +1995,16 @@ def test_generic_recursive_models_with_a_concrete_parameter(create_module):
 
         class M1(BaseModel, Generic[V1, V2]):
             a: V1
-            m: 'M2[V2]'
+            m2: 'M2[V2]'
 
         class M2(BaseModel, Generic[V3]):
-            m: Union[M1[int, V3], V3]
+            m1: M1[int, V3] | V3
 
         M1.model_rebuild()
 
     M1 = module.M1
-
-    # assert M1.__pydantic_core_schema__ == {}
-    assert collect_invalid_schemas(M1.__pydantic_core_schema__) is False
+    M1[float, str].model_validate({'a': 1.5, 'm2': {'m1': 'foo'}})
+    M1[float, str].model_validate({'a': 1.5, 'm2': {'m1': {'a': 3, 'm2': {'m1': 'foo'}}}})
 
 
 def test_generic_recursive_models_complicated(create_module):
@@ -1829,7 +2018,9 @@ def test_generic_recursive_models_complicated(create_module):
 
     @create_module
     def module():
-        from typing import Generic, TypeVar, Union
+        # Noqa comment because linter/type checker think the `Optional` in the `B2.a2`
+        # annotation comes from the module:
+        from typing import Generic, Optional, TypeVar, Union  # noqa: F401
 
         from pydantic import BaseModel
 
@@ -1844,7 +2035,7 @@ def test_generic_recursive_models_complicated(create_module):
             a2: 'A3[T2]'
 
         class A3(BaseModel, Generic[T3]):
-            a3: Union[A1[T3], T3]
+            a3: A1[T3] | T3
 
         A1.model_rebuild()
 
@@ -1855,7 +2046,7 @@ def test_generic_recursive_models_complicated(create_module):
             a1: 'B2[S1]'
 
         class B2(BaseModel, Generic[S2]):
-            a2: 'B1[S2]'
+            a2: 'B1[S2] | None' = None
 
         B1.model_rebuild()
 
@@ -1866,29 +2057,29 @@ def test_generic_recursive_models_complicated(create_module):
         class M1(BaseModel, Generic[V1, V2]):
             a: int
             b: B1[V2]
-            m: 'M2[V1]'
+            m2: 'M2[V1]'
 
         class M2(BaseModel, Generic[V3]):
-            m: Union[M1[V3, int], V3]
+            m1: M1[V3, int] | V3
 
         M1.model_rebuild()
 
     M1 = module.M1
 
-    assert collect_invalid_schemas(M1.__pydantic_core_schema__) is False
+    M1[str, float].model_validate({'a': 1, 'b': {'a1': {'a2': {'a1': {'a2': {'a1': {}}}}}}, 'm2': {'m1': 'foo'}})
 
 
 def test_generic_recursive_models_in_container(create_module):
     @create_module
     def module():
-        from typing import Generic, List, Optional, TypeVar
+        from typing import Generic, TypeVar
 
         from pydantic import BaseModel
 
         T = TypeVar('T')
 
         class MyGenericModel(BaseModel, Generic[T]):
-            foobar: Optional[List['MyGenericModel[T]']]
+            foobar: list['MyGenericModel[T]'] | None
             spam: T
 
     MyGenericModel = module.MyGenericModel
@@ -1918,7 +2109,7 @@ def test_generic_literal():
     ValueType = TypeVar('ValueType')
 
     class GModel(BaseModel, Generic[FieldType, ValueType]):
-        field: Dict[FieldType, ValueType]
+        field: dict[FieldType, ValueType]
 
     Fields = Literal['foo', 'bar']
     m = GModel[Fields, str](field={'foo': 'x'})
@@ -1947,10 +2138,10 @@ def test_generic_enums():
 def test_generic_with_user_defined_generic_field():
     T = TypeVar('T')
 
-    class GenericList(List[T]):
+    class GenericList(list[T]):
         @classmethod
         def __get_pydantic_core_schema__(cls, source_type: Any, handler: GetCoreSchemaHandler) -> CoreSchema:
-            return core_schema.no_info_after_validator_function(GenericList, handler(List[get_args(source_type)[0]]))
+            return core_schema.no_info_after_validator_function(GenericList, handler(list[get_args(source_type)[0]]))
 
     class Model(BaseModel, Generic[T]):
         field: GenericList[T]
@@ -1974,14 +2165,11 @@ def test_generic_annotated():
 def test_generic_subclass():
     T = TypeVar('T')
 
-    class A(BaseModel, Generic[T]):
-        ...
+    class A(BaseModel, Generic[T]): ...
 
-    class B(A[T], Generic[T]):
-        ...
+    class B(A[T], Generic[T]): ...
 
-    class C(B[T], Generic[T]):
-        ...
+    class C(B[T], Generic[T]): ...
 
     assert B[int].__name__ == 'B[int]'
     assert issubclass(B[int], B)
@@ -1993,11 +2181,9 @@ def test_generic_subclass_with_partial_application():
     T = TypeVar('T')
     S = TypeVar('S')
 
-    class A(BaseModel, Generic[T]):
-        ...
+    class A(BaseModel, Generic[T]): ...
 
-    class B(A[S], Generic[T, S]):
-        ...
+    class B(A[S], Generic[T, S]): ...
 
     PartiallyAppliedB = B[str, T]
     assert issubclass(PartiallyAppliedB[int], A)
@@ -2007,11 +2193,9 @@ def test_multilevel_generic_binding():
     T = TypeVar('T')
     S = TypeVar('S')
 
-    class A(BaseModel, Generic[T, S]):
-        ...
+    class A(BaseModel, Generic[T, S]): ...
 
-    class B(A[str, T], Generic[T]):
-        ...
+    class B(A[str, T], Generic[T]): ...
 
     assert B[int].__name__ == 'B[int]'
     assert issubclass(B[int], A)
@@ -2021,11 +2205,9 @@ def test_generic_subclass_with_extra_type():
     T = TypeVar('T')
     S = TypeVar('S')
 
-    class A(BaseModel, Generic[T]):
-        ...
+    class A(BaseModel, Generic[T]): ...
 
-    class B(A[S], Generic[T, S]):
-        ...
+    class B(A[S], Generic[T, S]): ...
 
     assert B[int, str].__name__ == 'B[int, str]', B[int, str].__name__
     assert issubclass(B[str, int], B)
@@ -2036,8 +2218,7 @@ def test_generic_subclass_with_extra_type_requires_all_params():
     T = TypeVar('T')
     S = TypeVar('S')
 
-    class A(BaseModel, Generic[T]):
-        ...
+    class A(BaseModel, Generic[T]): ...
 
     with pytest.raises(
         TypeError,
@@ -2046,8 +2227,7 @@ def test_generic_subclass_with_extra_type_requires_all_params():
         ),
     ):
 
-        class B(A[T], Generic[S]):
-            ...
+        class B(A[T], Generic[S]): ...
 
 
 def test_generic_subclass_with_extra_type_with_hint_message():
@@ -2076,21 +2256,17 @@ def test_generic_subclass_with_extra_type_with_hint_message():
             match='Classes should inherit from `BaseModel` before generic classes',
         ):
 
-            class ChildGenericClass(BaseGenericClass[E, Dict[str, Any]]):
-                ...
+            class ChildGenericClass(BaseGenericClass[E, dict[str, Any]]): ...
 
 
 def test_multi_inheritance_generic_binding():
     T = TypeVar('T')
 
-    class A(BaseModel, Generic[T]):
-        ...
+    class A(BaseModel, Generic[T]): ...
 
-    class B(A[int], Generic[T]):
-        ...
+    class B(A[int], Generic[T]): ...
 
-    class C(B[str], Generic[T]):
-        ...
+    class C(B[str], Generic[T]): ...
 
     assert C[float].__name__ == 'C[float]'
     assert issubclass(C[float], B)
@@ -2127,7 +2303,7 @@ def test_multi_inheritance_generic_defaults():
         x: str = 'a'
 
     class B(A[int], Generic[T]):
-        b: Optional[T] = None
+        b: T | None = None
         y: str = 'b'
 
     class C(B[str], Generic[T]):
@@ -2183,13 +2359,14 @@ def test_parse_generic_json():
                 'type': 'object',
             }
         },
-        'properties': {'message': {'allOf': [{'$ref': '#/$defs/Payload'}], 'title': 'Message'}},
+        'properties': {'message': {'$ref': '#/$defs/Payload', 'title': 'Message'}},
         'required': ['message'],
         'title': 'MessageWrapper[test_parse_generic_json.<locals>.Payload]',
         'type': 'object',
     }
 
 
+@pytest.mark.skipif(sys.version_info >= (3, 15), reason="memray doesn't yet support Python 3.15")
 def memray_limit_memory(limit):
     if '--memray' in sys.argv:
         return pytest.mark.limit_memory(limit)
@@ -2211,7 +2388,7 @@ def test_generics_memory_use():
 
     class MyModel(BaseModel, Generic[T, U, V]):
         message: Json[T]
-        field: Dict[U, V]
+        field: dict[U, V]
 
     class Outer(BaseModel, Generic[T]):
         inner: T
@@ -2225,10 +2402,10 @@ def test_generics_memory_use():
     ]
 
     containers = [
-        List,
-        Tuple,
-        Set,
-        FrozenSet,
+        list,
+        tuple,
+        set,
+        frozenset,
     ]
 
     all = [*types, *[container[tp] for container in containers for tp in types]]
@@ -2244,6 +2421,9 @@ def test_generics_memory_use():
             pass
 
 
+@pytest.mark.skipif(
+    sys.version_info < (3, 11), reason='list implementation is inconsistent between python versions here'
+)
 @pytest.mark.xfail(reason='Generic models are not type aliases', raises=TypeError)
 def test_generic_model_as_parameter_to_generic_type_alias() -> None:
     T = TypeVar('T')
@@ -2251,7 +2431,7 @@ def test_generic_model_as_parameter_to_generic_type_alias() -> None:
     class GenericPydanticModel(BaseModel, Generic[T]):
         x: T
 
-    GenericPydanticModelList = List[GenericPydanticModel[T]]
+    GenericPydanticModelList = list[GenericPydanticModel[T]]
     GenericPydanticModelList[int]
 
 
@@ -2261,7 +2441,7 @@ def test_double_typevar_substitution() -> None:
     class GenericPydanticModel(BaseModel, Generic[T]):
         x: T = []
 
-    assert GenericPydanticModel[List[T]](x=[1, 2, 3]).model_dump() == {'x': [1, 2, 3]}
+    assert GenericPydanticModel[list[T]](x=[1, 2, 3]).model_dump() == {'x': [1, 2, 3]}
 
 
 @pytest.fixture(autouse=True)
@@ -2339,7 +2519,7 @@ def test_construct_generic_model_with_validation():
     class Page(BaseModel, Generic[T]):
         page: int = Field(ge=42)
         items: Sequence[T]
-        unenforced: PositiveInt = Field(..., lt=10)
+        unenforced: PositiveInt = Field(lt=10)
 
     with pytest.raises(ValidationError) as exc_info:
         Page[int](page=41, items=[], unenforced=11)
@@ -2435,7 +2615,7 @@ def test_generic_enum_bound():
 
     # insert_assert(Model[MyEnum].model_json_schema())
     assert Model[MyEnum].model_json_schema() == {
-        '$defs': {'MyEnum': {'const': 1, 'enum': [1], 'title': 'MyEnum', 'type': 'integer'}},
+        '$defs': {'MyEnum': {'enum': [1], 'title': 'MyEnum', 'type': 'integer'}},
         'properties': {'x': {'$ref': '#/$defs/MyEnum'}},
         'required': ['x'],
         'title': 'Model[test_generic_enum_bound.<locals>.MyEnum]',
@@ -2487,7 +2667,7 @@ def test_generic_intenum_bound():
 
     # insert_assert(Model[MyEnum].model_json_schema())
     assert Model[MyEnum].model_json_schema() == {
-        '$defs': {'MyEnum': {'const': 1, 'enum': [1], 'title': 'MyEnum', 'type': 'integer'}},
+        '$defs': {'MyEnum': {'enum': [1], 'title': 'MyEnum', 'type': 'integer'}},
         'properties': {'x': {'$ref': '#/$defs/MyEnum'}},
         'required': ['x'],
         'title': 'Model[test_generic_intenum_bound.<locals>.MyEnum]',
@@ -2515,8 +2695,8 @@ def test_variadic_generic_init():
 
     class VariadicToolbox(BaseModel, Generic[ComponentVar, Unpack[NumberOfComponents]]):
         main_component: ComponentVar
-        left_component_pocket: Optional[list[ComponentVar]] = Field(default_factory=list)
-        right_component_pocket: Optional[list[ComponentVar]] = Field(default_factory=list)
+        left_component_pocket: list[ComponentVar] | None = Field(default_factory=list)
+        right_component_pocket: list[ComponentVar] | None = Field(default_factory=list)
 
         @computed_field
         @property
@@ -2549,8 +2729,8 @@ def test_variadic_generic_with_variadic_fields():
     NumberOfComponents = TypeVarTuple('NumberOfComponents')
 
     class VariadicToolbox(BaseModel, Generic[ComponentVar, Unpack[NumberOfComponents]]):
-        toolbelt_cm_size: Optional[tuple[Unpack[NumberOfComponents]]] = Field(default_factory=tuple)
-        manual_toolset: Optional[tuple[ComponentVar, Unpack[NumberOfComponents]]] = Field(default_factory=tuple)
+        toolbelt_cm_size: tuple[Unpack[NumberOfComponents]] | None = Field(default_factory=tuple)
+        manual_toolset: tuple[ComponentVar, Unpack[NumberOfComponents]] | None = Field(default_factory=tuple)
 
     MyToolboxClass = VariadicToolbox[Screwdriver, Screwdriver, Wrench]
 
@@ -2804,7 +2984,7 @@ def test_serialize_unsubstituted_typevars_bound_default_supported() -> None:
     ids=['default', 'constraint'],
 )
 def test_serialize_unsubstituted_typevars_variants(
-    type_var: Type[BaseModel],
+    type_var: TypeVar,
 ) -> None:
     class ErrorDetails(BaseModel):
         foo: str
@@ -2861,14 +3041,93 @@ def test_serialize_unsubstituted_typevars_variants(
     }
 
 
-def test_mix_default_and_constraints() -> None:
-    T = TypingExtensionsTypeVar('T', str, int, default=str)
+def test_serialize_typevars_default_and_bound_with_user_model() -> None:
+    class MyErrorDetails(BaseModel):
+        bar: str
 
-    msg = 'Pydantic does not support mixing more than one of TypeVar bounds, constraints and defaults'
-    with pytest.raises(NotImplementedError, match=msg):
+    class ExtendedMyErrorDetails(MyErrorDetails):
+        foo: str
 
-        class _(BaseModel, Generic[T]):
-            x: T
+    class MoreExtendedMyErrorDetails(ExtendedMyErrorDetails):
+        suu: str
+
+    T = TypingExtensionsTypeVar('T', bound=MyErrorDetails, default=ExtendedMyErrorDetails)
+
+    class Error(BaseModel, Generic[T]):
+        message: str
+        details: T
+
+    # bound small parent model
+    sample_error = Error[MyErrorDetails](
+        message='We just had an error',
+        details=MyErrorDetails(foo='var', bar='baz', suu='suu'),
+    )
+
+    assert sample_error.details.model_dump() == {
+        'bar': 'baz',
+    }
+    assert sample_error.model_dump() == {
+        'message': 'We just had an error',
+        'details': {
+            'bar': 'baz',
+        },
+    }
+
+    # default middle child model
+    sample_error = Error(
+        message='We just had an error',
+        details=MoreExtendedMyErrorDetails(foo='var', bar='baz', suu='suu'),
+    )
+
+    assert sample_error.details.model_dump() == {
+        'foo': 'var',
+        'bar': 'baz',
+        'suu': 'suu',
+    }
+    assert sample_error.model_dump() == {
+        'message': 'We just had an error',
+        'details': {'foo': 'var', 'bar': 'baz'},
+    }
+
+    # bound big child model
+    sample_error = Error[MoreExtendedMyErrorDetails](
+        message='We just had an error',
+        details=MoreExtendedMyErrorDetails(foo='var', bar='baz', suu='suu'),
+    )
+
+    assert sample_error.details.model_dump() == {
+        'foo': 'var',
+        'bar': 'baz',
+        'suu': 'suu',
+    }
+    assert sample_error.model_dump() == {
+        'message': 'We just had an error',
+        'details': {
+            'foo': 'var',
+            'bar': 'baz',
+            'suu': 'suu',
+        },
+    }
+
+
+def test_typevars_default_model_validation_error() -> None:
+    class MyErrorDetails(BaseModel):
+        bar: str
+
+    class ExtendedMyErrorDetails(MyErrorDetails):
+        foo: str
+
+    T = TypingExtensionsTypeVar('T', bound=MyErrorDetails, default=ExtendedMyErrorDetails)
+
+    class Error(BaseModel, Generic[T]):
+        message: str
+        details: T
+
+    with pytest.raises(ValidationError):
+        Error(
+            message='We just had an error',
+            details=MyErrorDetails(foo='var', bar='baz'),
+        )
 
 
 def test_generic_with_not_required_in_typed_dict() -> None:
@@ -2894,3 +3153,136 @@ def test_generic_with_allow_extra():
     # This used to raise an error related to accessing the __annotations__ attribute of the Generic class
     class AllowExtraGeneric(BaseModel, Generic[T], extra='allow'):
         data: T
+
+
+def test_generic_field():
+    """Test for https://github.com/pydantic/pydantic/issues/10039.
+
+    This was originally fixed by defining a custom MRO for Pydantic models,
+    but the fix from https://github.com/pydantic/pydantic/pull/10666 seemed
+    better. Test is still kept for historical purposes.
+    """
+
+    T = TypeVar('T')
+
+    class A(BaseModel, Generic[T]): ...
+
+    class B(A[T]): ...
+
+    class C(B[bool]): ...
+
+    class Model(BaseModel):
+        input_bool: A[bool]
+
+    Model(input_bool=C())
+
+
+def test_generic_any_or_never() -> None:
+    T = TypeVar('T')
+
+    class GenericModel(BaseModel, Generic[T]):
+        f: T | int
+
+    any_json_schema = GenericModel[Any].model_json_schema()
+    assert any_json_schema['properties']['f'] == {'title': 'F'}  # any type
+
+    never_json_schema = GenericModel[Never].model_json_schema()
+    assert never_json_schema['properties']['f'] == {'type': 'integer', 'title': 'F'}
+
+
+def test_revalidation_against_any() -> None:
+    T = TypeVar('T')
+
+    class ResponseModel(BaseModel, Generic[T]):
+        content: T
+
+    class Product(BaseModel):
+        name: str
+        price: float
+
+    class Order(BaseModel):
+        id: int
+        product: ResponseModel[Any]
+
+    product = Product(name='Apple', price=0.5)
+    response1: ResponseModel[Any] = ResponseModel[Any](content=product)
+    response2: ResponseModel[Any] = ResponseModel(content=product)
+    response3: ResponseModel[Any] = ResponseModel[Product](content=product)
+
+    for response in response1, response2, response3:
+        order = Order(id=1, product=response)
+        assert isinstance(order.product.content, Product)
+
+
+def test_revalidation_without_explicit_parametrization() -> None:
+    """Note, this is seen in the test above as well, but is added here for thoroughness."""
+
+    T1 = TypeVar('T1', bound=BaseModel)
+
+    class InnerModel(BaseModel, Generic[T1]):
+        model: T1
+
+    T2 = TypeVar('T2', bound=InnerModel)
+
+    class OuterModel(BaseModel, Generic[T2]):
+        inner: T2
+
+    class MyModel(BaseModel):
+        foo: int
+
+    # Construct two instances, with and without generic annotation in the constructor:
+    inner1 = InnerModel[MyModel](model=MyModel(foo=42))
+    inner2 = InnerModel(model=MyModel(foo=42))
+    assert inner1 == inner2
+
+    outer1 = OuterModel[InnerModel[MyModel]](inner=inner1)
+    outer2 = OuterModel[InnerModel[MyModel]](inner=inner2)
+    # implies that validation succeeds for both
+    assert outer1 == outer2
+
+
+def test_revalidation_with_basic_inference() -> None:
+    T = TypeVar('T')
+
+    class Inner(BaseModel, Generic[T]):
+        inner: T
+
+    class Holder(BaseModel, Generic[T]):
+        inner: Inner[T]
+
+    holder1 = Holder[int](inner=Inner[int](inner=1))
+    holder2 = Holder(inner=Inner(inner=1))
+    # implies that validation succeeds for both
+    assert holder1 == holder2
+
+
+def test_slots_forwarded_from_generic_class() -> None:
+    """https://github.com/pydantic/pydantic/issues/13215"""
+
+    T = TypeVar('T')
+
+    class Base(BaseModel, Generic[T]):
+        __slots__ = ()
+
+    BaseInt = Base[int]
+
+    assert BaseInt.__dict__['__slots__'] == ()
+
+    if platform.python_implementation() != 'PyPy':
+        with pytest.raises(TypeError):
+            # As per https://docs.python.org/3/reference/datamodel.html#slots:
+            weakref.ref(BaseInt())
+
+
+def test_generics_parameterization_not_hashable() -> None:
+    class NoHash:
+        __hash__ = None
+
+    T = TypeVar('T')
+
+    class Model(BaseModel, Generic[T]):
+        f: T
+
+    Mint = Model[Annotated[int, NoHash()]]
+
+    assert Mint(f='1').f == 1

@@ -1,15 +1,47 @@
 import dataclasses
 import gc
 import pickle
-from typing import Optional, Type
+import platform
+import subprocess
+import sys
+from pathlib import Path
+from textwrap import dedent
+from typing import TYPE_CHECKING
 
-import cloudpickle
 import pytest
 
 import pydantic
 from pydantic import BaseModel, PositiveFloat, ValidationError
 from pydantic._internal._model_construction import _PydanticWeakRef
 from pydantic.config import ConfigDict
+
+IS_PYPY = sys.implementation.name == 'pypy' and sys.version_info >= (3, 11)
+
+if TYPE_CHECKING:
+    import cloudpickle
+else:
+    if not IS_PYPY:
+        try:
+            import cloudpickle
+        except ImportError:
+            cloudpickle = None
+    else:
+        cloudpickle = None
+
+TEST_DATA_DIR = Path(__file__).parent / 'test_data'
+
+pytestmark = pytest.mark.skipif(
+    cloudpickle is None,
+    reason='cloudpickle is not installed, or tests are running with PyPy (https://github.com/cloudpipe/cloudpickle/issues/592).',
+)
+
+# Note: this xfail marker was used when cloudpickle was partially compatible with PyPy. Since PyPy 7.3.22, it isn't compatible
+# at all (importing it fails), so all tests are skipped as per the module's `pytestmark`. We keep the xfail marker if this ever
+# changes:
+cloudpickle_pypy_xfail = pytest.mark.xfail(
+    condition=IS_PYPY,
+    reason='Cloudpickle issue: - possibly https://github.com/cloudpipe/cloudpickle/issues/557',
+)
 
 
 class IntWrapper:
@@ -62,14 +94,14 @@ def test_pickle_pydantic_weakref():
 
 class ImportableModel(BaseModel):
     foo: str
-    bar: Optional[str] = None
+    bar: str | None = None
     val: PositiveFloat = 0.7
 
 
-def model_factory() -> Type:
+def model_factory() -> type:
     class NonImportableModel(BaseModel):
         foo: str
-        bar: Optional[str] = None
+        bar: str | None = None
         val: PositiveFloat = 0.7
 
     return NonImportableModel
@@ -81,11 +113,14 @@ def model_factory() -> Type:
         # Importable model can be pickled with either pickle or cloudpickle.
         (ImportableModel, False),
         (ImportableModel, True),
-        # Locally-defined model can only be pickled with cloudpickle.
-        (model_factory(), True),
+        # Locally-defined model can only be pickle
+        # # Note: this xfail marker was used when cloudpickle was partially compatible with PyPy. Since PyPy 7.3.22, it is completelyisn't compatible
+        # # at all (importing it fails), so all tests are skipped as per the module's `pytestmark`. We keep the xfail marker if this ever
+        # # changes:d with cloudpickle.
+        pytest.param(model_factory(), True, marks=cloudpickle_pypy_xfail),
     ],
 )
-def test_pickle_model(model_type: Type, use_cloudpickle: bool):
+def test_pickle_model(model_type: type, use_cloudpickle: bool):
     if use_cloudpickle:
         model_type = cloudpickle.loads(cloudpickle.dumps(model_type))
     else:
@@ -113,7 +148,7 @@ class ImportableNestedModel(BaseModel):
     inner: ImportableModel
 
 
-def nested_model_factory() -> Type:
+def nested_model_factory() -> type:
     class NonImportableNestedModel(BaseModel):
         inner: ImportableModel
 
@@ -127,10 +162,10 @@ def nested_model_factory() -> Type:
         (ImportableNestedModel, False),
         (ImportableNestedModel, True),
         # Locally-defined model can only be pickled with cloudpickle.
-        (nested_model_factory(), True),
+        pytest.param(nested_model_factory(), True, marks=cloudpickle_pypy_xfail),
     ],
 )
-def test_pickle_nested_model(model_type: Type, use_cloudpickle: bool):
+def test_pickle_nested_model(model_type: type, use_cloudpickle: bool):
     if use_cloudpickle:
         model_type = cloudpickle.loads(cloudpickle.dumps(model_type))
     else:
@@ -157,7 +192,7 @@ class ImportableDataclass:
     b: float
 
 
-def dataclass_factory() -> Type:
+def dataclass_factory() -> type:
     @pydantic.dataclasses.dataclass
     class NonImportableDataclass:
         a: int
@@ -172,7 +207,7 @@ class ImportableBuiltinDataclass:
     b: float
 
 
-def builtin_dataclass_factory() -> Type:
+def builtin_dataclass_factory() -> type:
     @dataclasses.dataclass
     class NonImportableBuiltinDataclass:
         a: int
@@ -185,7 +220,7 @@ class ImportableChildDataclass(ImportableDataclass):
     pass
 
 
-def child_dataclass_factory() -> Type:
+def child_dataclass_factory() -> type:
     class NonImportableChildDataclass(ImportableDataclass):
         pass
 
@@ -201,15 +236,15 @@ def child_dataclass_factory() -> Type:
         (ImportableChildDataclass, False),
         (ImportableChildDataclass, True),
         # Locally-defined Pydantic dataclass can only be pickled with cloudpickle.
-        (dataclass_factory(), True),
+        pytest.param(dataclass_factory(), True, marks=cloudpickle_pypy_xfail),
         (child_dataclass_factory(), True),
         # Pydantic dataclass generated from builtin can only be pickled with cloudpickle.
-        (pydantic.dataclasses.dataclass(ImportableBuiltinDataclass), True),
+        pytest.param(pydantic.dataclasses.dataclass(ImportableBuiltinDataclass), True, marks=cloudpickle_pypy_xfail),
         # Pydantic dataclass generated from locally-defined builtin can only be pickled with cloudpickle.
-        (pydantic.dataclasses.dataclass(builtin_dataclass_factory()), True),
+        pytest.param(pydantic.dataclasses.dataclass(builtin_dataclass_factory()), True, marks=cloudpickle_pypy_xfail),
     ],
 )
-def test_pickle_dataclass(dataclass_type: Type, use_cloudpickle: bool):
+def test_pickle_dataclass(dataclass_type: type, use_cloudpickle: bool):
     if use_cloudpickle:
         dataclass_type = cloudpickle.loads(cloudpickle.dumps(dataclass_type))
     else:
@@ -244,7 +279,7 @@ class ImportableNestedDataclassModel(BaseModel):
     inner: ImportableBuiltinDataclass
 
 
-def nested_dataclass_model_factory() -> Type:
+def nested_dataclass_model_factory() -> type:
     class NonImportableNestedDataclassModel(BaseModel):
         inner: ImportableBuiltinDataclass
 
@@ -258,10 +293,10 @@ def nested_dataclass_model_factory() -> Type:
         (ImportableNestedDataclassModel, False),
         (ImportableNestedDataclassModel, True),
         # Locally-defined model can only be pickled with cloudpickle.
-        (nested_dataclass_model_factory(), True),
+        pytest.param(nested_dataclass_model_factory(), True, marks=cloudpickle_pypy_xfail),
     ],
 )
-def test_pickle_dataclass_nested_in_model(model_type: Type, use_cloudpickle: bool):
+def test_pickle_dataclass_nested_in_model(model_type: type, use_cloudpickle: bool):
     if use_cloudpickle:
         model_type = cloudpickle.loads(cloudpickle.dumps(model_type))
     else:
@@ -284,7 +319,7 @@ class ImportableModelWithConfig(BaseModel):
     model_config = ConfigDict(title='MyTitle')
 
 
-def model_with_config_factory() -> Type:
+def model_with_config_factory() -> type:
     class NonImportableModelWithConfig(BaseModel):
         model_config = ConfigDict(title='MyTitle')
 
@@ -296,13 +331,61 @@ def model_with_config_factory() -> Type:
     [
         (ImportableModelWithConfig, False),
         (ImportableModelWithConfig, True),
-        (model_with_config_factory(), True),
+        pytest.param(model_with_config_factory(), True, marks=cloudpickle_pypy_xfail),
     ],
 )
-def test_pickle_model_with_config(model_type: Type, use_cloudpickle: bool):
+def test_pickle_model_with_config(model_type: type, use_cloudpickle: bool):
     if use_cloudpickle:
         model_type = cloudpickle.loads(cloudpickle.dumps(model_type))
     else:
         model_type = pickle.loads(pickle.dumps(model_type))
 
     assert model_type.model_config['title'] == 'MyTitle'
+
+
+@pytest.mark.xfail(platform.python_implementation() == 'PyPy', reason='Unpickling fails on PyPy')
+def test_cloudpickle_model_with_defs(tmp_path) -> None:
+    """https://github.com/pydantic/pydantic/issues/12696
+
+    The issue only reproduces if the unpickled function runs in a different process, and it seems we need
+    to pickle the `bar_repr()` in `__main__` so that it fully encodes the core schema data.
+    """
+
+    pickle_file = tmp_path / 'model.pkl'
+
+    code = dedent(
+        """
+        import sys
+        from pathlib import Path
+
+        import cloudpickle
+
+        from pydantic import BaseModel
+
+
+        class Foo(BaseModel):
+            foo: int
+
+
+        class Bar(BaseModel):
+            bar1: Foo
+            bar2: Foo
+
+
+        def bar_repr() -> str:
+            json = '{"bar1": {"foo": 1}, "bar2": {"foo": 2}}'
+            bar = Bar.model_validate_json(json)
+            return repr(bar)
+
+        with open(sys.argv[1], 'w+b') as out:
+            cloudpickle.dump(bar_repr, out)
+        """
+    )
+
+    pickle_file = tmp_path / 'model.pkl'
+
+    subprocess.run([sys.executable, '-c', code, str(pickle_file)])
+
+    bar_repr = cloudpickle.loads(pickle_file.read_bytes())
+
+    assert bar_repr() == 'Bar(bar1=Foo(foo=1), bar2=Foo(foo=2))'

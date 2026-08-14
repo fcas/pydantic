@@ -1,9 +1,7 @@
-from typing import List, Tuple
-
 import pytest
 from pydantic_core import CoreSchema
 
-from pydantic import BaseModel, GetJsonSchemaHandler, ValidationError, model_validator, parse_obj_as
+from pydantic import BaseModel, GetJsonSchemaHandler, PydanticUserError, ValidationError, model_validator, parse_obj_as
 from pydantic.functional_serializers import model_serializer
 from pydantic.json_schema import JsonSchemaValue
 
@@ -62,7 +60,7 @@ def test_model_validate_wrong_model():
 
 def test_root_model_error():
     with pytest.raises(
-        TypeError, match="To define root models, use `pydantic.RootModel` rather than a field called '__root__'"
+        PydanticUserError, match="To define root models, use `pydantic.RootModel` rather than a field called '__root__'"
     ):
 
         class MyModel(BaseModel):
@@ -111,7 +109,7 @@ def test_model_validate_root():
 
 def test_parse_root_list():
     class MyModel(BaseModel):
-        root: List[str]
+        root: list[str]
 
         @model_validator(mode='before')
         @classmethod
@@ -141,7 +139,7 @@ def test_parse_nested_root_list():
         id: str
 
     class NestedModel(BaseModel):
-        root: List[NestedData]
+        root: list[NestedData]
 
         @model_validator(mode='before')
         @classmethod
@@ -174,7 +172,7 @@ def test_parse_nested_root_tuple():
         id: str
 
     class NestedModel(BaseModel):
-        root: Tuple[int, NestedData]
+        root: tuple[int, NestedData]
 
         @model_validator(mode='before')
         @classmethod
@@ -194,7 +192,7 @@ def test_parse_nested_root_tuple():
             return json_schema['properties']['root']
 
     class MyModel(BaseModel):
-        nested: List[NestedModel]
+        nested: list[NestedModel]
 
     data = [0, {'id': 'foo'}]
     m = MyModel.model_validate({'nested': [data]})
@@ -207,7 +205,7 @@ def test_parse_nested_root_tuple():
 
 def test_parse_nested_custom_root():
     class NestedModel(BaseModel):
-        root: List[str]
+        root: list[str]
 
         @model_validator(mode='before')
         @classmethod
@@ -250,7 +248,7 @@ def test_parse_nested_custom_root():
     m = MyModel.model_validate(nested)
     assert isinstance(m, MyModel)
     assert isinstance(m.root, NestedModel)
-    assert isinstance(m.root.root, List)
+    assert isinstance(m.root.root, list)
     assert isinstance(m.root.root[0], str)
 
 

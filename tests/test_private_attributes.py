@@ -1,10 +1,12 @@
 import functools
-from typing import ClassVar, Generic, TypeVar
+from enum import Enum
+from typing import Annotated, ClassVar, Generic, TypeVar
 
 import pytest
 from pydantic_core import PydanticUndefined
 
-from pydantic import BaseModel, ConfigDict, PrivateAttr, computed_field
+from pydantic import BaseModel, ConfigDict, PrivateAttr, PydanticUserError, computed_field
+from pydantic.fields import ModelPrivateAttr
 
 
 def test_private_attribute():
@@ -66,7 +68,7 @@ def test_private_attribute_nested():
 def test_private_attribute_factory():
     default = {'a': {}}
 
-    def factory():
+    def factory() -> dict[str, dict]:
         return default
 
     class Model(BaseModel):
@@ -84,6 +86,48 @@ def test_private_attribute_factory():
 
     assert m.model_dump() == {}
     assert m.__dict__ == {}
+
+
+def test_private_attribute_factory_uses_validated_data():
+    def factory(data: dict[str, str]) -> str:
+        return data['foo'] + data['bar']
+
+    class Model(BaseModel):
+        foo: str
+        bar: str
+        _foobaz = PrivateAttr(default_factory=factory)
+
+    m = Model(foo='foo', bar='bar')
+    assert m._foobaz == 'foobar'
+
+
+def test_private_attribute_factory_uses_other_private_attribute():
+    def factory(data: dict[str, str]) -> str:
+        return data['foo'] + data['bar'] + data['_foobaz']
+
+    class Model(BaseModel):
+        foo: str
+        bar: str
+        _foobaz = PrivateAttr(default='foobaz')
+        _foobazfoo = PrivateAttr(default_factory=factory)
+
+    m = Model(foo='foo', bar='bar')
+    assert m._foobaz == 'foobaz'
+    assert m._foobazfoo == 'foobarfoobaz'
+
+
+def test_private_attribute_factory_unset_private():
+    def factory(data: dict[str, str]) -> str:
+        return data['foo'] + data['bar'] + data['_foobazfoo']
+
+    class Model(BaseModel):
+        foo: str
+        bar: str
+        _foobaz = PrivateAttr(default_factory=factory)
+        _foobazfoo = PrivateAttr(default='foobazfoo')
+
+    with pytest.raises(KeyError, match='_foobazfoo'):
+        Model(foo='foo', bar='bar')
 
 
 def test_private_attribute_annotation():
@@ -162,7 +206,7 @@ def test_private_attribute_intersection_with_extra_field():
 
 def test_private_attribute_invalid_name():
     with pytest.raises(
-        NameError,
+        PydanticUserError,
         match="Private attributes must not use valid field names; use sunder names, e.g. '_foo' instead of 'foo'.",
     ):
 
@@ -288,8 +332,8 @@ def test_private_attribute_multiple_inheritance():
 
 def test_private_attributes_not_dunder() -> None:
     with pytest.raises(
-        NameError,
-        match='Private attributes must not use dunder names;' " use a single underscore prefix instead of '__foo__'.",
+        PydanticUserError,
+        match="Private attributes must not use dunder names; use a single underscore prefix instead of '__foo__'.",
     ):
 
         class MyModel(BaseModel):
@@ -340,16 +384,15 @@ def test_none_as_private_attr():
 
 
 def test_layout_compatible_multiple_private_parents():
-    import typing as t
 
     import pydantic
 
     class ModelMixin(pydantic.BaseModel):
-        _mixin_private: t.Optional[str] = pydantic.PrivateAttr(None)
+        _mixin_private: str | None = pydantic.PrivateAttr(None)
 
     class Model(pydantic.BaseModel):
         public: str = 'default'
-        _private: t.Optional[str] = pydantic.PrivateAttr(None)
+        _private: str | None = pydantic.PrivateAttr(None)
 
     class NewModel(ModelMixin, Model):
         pass
@@ -388,7 +431,7 @@ from pydantic import BaseModel
 import typing as t
 
 class BaseConfig(BaseModel):
-    _FIELD_UPDATE_STRATEGY: t.ClassVar[t.Dict[str, t.Any]] = {}
+    _FIELD_UPDATE_STRATEGY: t.ClassVar[t.dict[str, t.Any]] = {}
 """
     )
 
@@ -449,3 +492,172 @@ def test_private_properties_not_included_in_repr_by_default_cached_property() ->
     m = Model(foo=1)
     m_repr = repr(m)
     assert '_private_cached_property' not in m_repr
+
+
+@pytest.mark.parametrize('base', [ModelPrivateAttr, object])
+@pytest.mark.parametrize('use_annotation', [True, False])
+def test_private_descriptors(base, use_annotation):
+    set_name_calls = []
+    get_calls = []
+    set_calls = []
+    delete_calls = []
+
+    class MyDescriptor(base):
+        def __init__(self, fn):
+            super().__init__()
+            self.fn = fn
+            self.name = ''
+
+        def __set_name__(self, owner, name):
+            set_name_calls.append((owner, name))
+            self.name = name
+
+        def __get__(self, obj, type=None):
+            get_calls.append((obj, type))
+            return self.fn(obj) if obj else self
+
+        def __set__(self, obj, value):
+            set_calls.append((obj, value))
+            self.fn = lambda obj: value
+
+        def __delete__(self, obj):
+            delete_calls.append(obj)
+
+            def fail(obj):
+                # I have purposely not used the exact formatting you'd get if the attribute wasn't defined,
+                # to make it clear this function is being called, while also having sensible behavior
+                raise AttributeError(f'{self.name!r} is not defined on {obj!r}')
+
+            self.fn = fail
+
+    class A(BaseModel):
+        x: int
+
+        if use_annotation:
+            _some_func: MyDescriptor = MyDescriptor(lambda self: self.x)
+        else:
+            _some_func = MyDescriptor(lambda self: self.x)
+
+        @property
+        def _double_x(self):
+            return self.x * 2
+
+    assert set(A.__private_attributes__) == {'_some_func'}
+    assert set_name_calls == [(A, '_some_func')]
+
+    a = A(x=2)
+
+    assert a._double_x == 4  # Ensure properties with leading underscores work fine and don't become private attributes
+
+    assert get_calls == []
+    assert a._some_func == 2
+    assert get_calls == [(a, A)]
+
+    assert set_calls == []
+    a._some_func = 3
+    assert set_calls == [(a, 3)]
+
+    assert a._some_func == 3
+    assert get_calls == [(a, A), (a, A)]
+
+    assert delete_calls == []
+    del a._some_func
+    assert delete_calls == [a]
+
+    with pytest.raises(AttributeError, match=r"'_some_func' is not defined on A\(x=2\)"):
+        a._some_func
+    assert get_calls == [(a, A), (a, A), (a, A)]
+
+
+def test_private_attr_set_name():
+    class SetNameInt(int):
+        _owner_attr_name: str | None = None
+
+        def __set_name__(self, owner, name):
+            self._owner_attr_name = f'{owner.__name__}.{name}'
+
+    _private_attr_default = SetNameInt(1)
+
+    class Model(BaseModel):
+        _private_attr_1: int = PrivateAttr(default=_private_attr_default)
+        _private_attr_2: SetNameInt = SetNameInt(2)
+
+    assert _private_attr_default._owner_attr_name == 'Model._private_attr_1'
+
+    m = Model()
+    assert m._private_attr_1 == 1
+    assert m._private_attr_1._owner_attr_name == 'Model._private_attr_1'
+    assert m._private_attr_2 == 2
+    assert m._private_attr_2._owner_attr_name == 'Model._private_attr_2'
+
+
+def test_private_attr_default_descriptor_attribute_error():
+    class SetNameInt(int):
+        def __get__(self, obj, cls):
+            return self
+
+    _private_attr_default = SetNameInt(1)
+
+    class Model(BaseModel):
+        _private_attr: int = PrivateAttr(default=_private_attr_default)
+
+    assert Model.__private_attributes__['_private_attr'].__get__(None, Model) == _private_attr_default
+
+    with pytest.raises(AttributeError, match="'ModelPrivateAttr' object has no attribute 'some_attr'"):
+        Model.__private_attributes__['_private_attr'].some_attr
+
+
+def test_private_attr_set_name_do_not_crash_if_not_callable():
+    class SetNameInt(int):
+        __set_name__ = None
+
+    _private_attr_default = SetNameInt(2)
+
+    class Model(BaseModel):
+        _private_attr: int = PrivateAttr(default=_private_attr_default)
+
+    # Checks below are just to ensure that everything is the same as in `test_private_attr_set_name`
+    # The main check is that model class definition above doesn't crash
+    assert Model()._private_attr == 2
+
+
+def test_private_attribute_not_skipped_during_ns_inspection() -> None:
+    # It is important for the enum name to start with the class name
+    # (it previously caused issues as we were comparing qualnames without
+    # taking this into account):
+    class Fullname(str, Enum):
+        pass
+
+    class Full(BaseModel):
+        _priv: object = Fullname
+
+    assert isinstance(Full._priv, ModelPrivateAttr)
+
+
+def test_private_attribute_fake_classvar() -> None:
+    ClassVar = list  # noqa: F841
+
+    class Model(BaseModel):
+        _priv: 'ClassVar[int]'
+
+    assert isinstance(Model._priv, ModelPrivateAttr)
+
+
+def test_private_attribute_from_annotated_metadata_set_name() -> None:
+    # Unlike private attributes assigned a value (where `type.__new__()` natively invokes
+    # `__set_name__` on the value present in the namespace), annotation-only private attributes
+    # are never seen during class creation, so `collect_model_fields()` is responsible
+    # for calling `__set_name__()`:
+    set_name_calls: list[tuple[type, str]] = []
+
+    class SetNameInt(int):
+        def __set_name__(self, owner: type, name: str) -> None:
+            set_name_calls.append((owner, name))
+
+    default = SetNameInt(1)
+
+    class Model(BaseModel):
+        _priv: Annotated[int, PrivateAttr(default=default)]
+
+    assert set_name_calls == [(Model, '_priv')]
+    assert Model()._priv == 1

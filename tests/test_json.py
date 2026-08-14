@@ -1,18 +1,20 @@
 import json
+import math
 import re
 import sys
+from collections.abc import Generator
 from dataclasses import dataclass as vanilla_dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from enum import Enum
 from ipaddress import IPv4Address, IPv4Interface, IPv4Network, IPv6Address, IPv6Interface, IPv6Network
 from pathlib import Path
-from typing import Any, Generator, List, Optional, Pattern, Union
+from re import Pattern
+from typing import Annotated, Any, Optional, Union
 from uuid import UUID
 
 import pytest
 from pydantic_core import CoreSchema, SchemaSerializer, core_schema
-from typing_extensions import Annotated
 
 from pydantic import (
     AfterValidator,
@@ -22,6 +24,8 @@ from pydantic import (
     GetJsonSchemaHandler,
     NameEmail,
     PlainSerializer,
+    RootModel,
+    TypeAdapter,
 )
 from pydantic._internal._config import ConfigWrapper
 from pydantic._internal._generate_schema import GenerateSchema
@@ -32,7 +36,6 @@ from pydantic.functional_serializers import (
     field_serializer,
 )
 from pydantic.json_schema import JsonSchemaValue
-from pydantic.type_adapter import TypeAdapter
 from pydantic.types import DirectoryPath, FilePath, SecretBytes, SecretStr, condecimal
 
 try:
@@ -376,21 +379,21 @@ def test_resolve_ref_schema_recursive_model():
         ) -> JsonSchemaValue:
             json_schema = super().__get_pydantic_json_schema__(core_schema, handler)
             json_schema = handler.resolve_ref_schema(json_schema)
-            json_schema['examples'] = {'foo': {'mini_me': None}}
+            json_schema['examples'] = [{'foo': {'mini_me': None}}]
             return json_schema
 
     # insert_assert(Model.model_json_schema())
     assert Model.model_json_schema() == {
         '$defs': {
             'Model': {
-                'examples': {'foo': {'mini_me': None}},
+                'examples': [{'foo': {'mini_me': None}}],
                 'properties': {'mini_me': {'anyOf': [{'$ref': '#/$defs/Model'}, {'type': 'null'}]}},
                 'required': ['mini_me'],
                 'title': 'Model',
                 'type': 'object',
             }
         },
-        'allOf': [{'$ref': '#/$defs/Model'}],
+        '$ref': '#/$defs/Model',
     }
 
 
@@ -463,7 +466,7 @@ def test_json_encoders_on_model() -> None:
         m: Model
 
     class Outermost(BaseModel):
-        inner: Union[Outer1, Outer2]
+        inner: Outer1 | Outer2
 
     m = Outermost(inner=Outer1(m=Model(x=1)))
     # insert_assert(m.model_dump())
@@ -491,12 +494,95 @@ def test_json_encoders_types() -> None:
 
     class A(BaseModel):
         a: MyEnum
-        b: List[int]
+        b: list[int]
         c: Decimal
         model_config = ConfigDict(
-            json_encoders={Enum: lambda val: val.name, List[int]: lambda val: 'list!', Decimal: lambda val: 'decimal!'}
+            json_encoders={Enum: lambda val: val.name, list[int]: lambda val: 'list!', Decimal: lambda val: 'decimal!'}
         )
 
     m = A(a=MyEnum.A, b=[1, 2, 3], c=Decimal('0'))
     assert m.model_dump_json() == '{"a":"A","b":"list!","c":"decimal!"}'
     assert m.model_dump() == {'a': MyEnum.A, 'b': [1, 2, 3], 'c': Decimal('0')}
+
+
+@pytest.mark.parametrize(
+    'float_value,encoded_str',
+    [
+        (float('inf'), 'Infinity'),
+        (float('-inf'), '-Infinity'),
+        (float('nan'), 'NaN'),
+    ],
+)
+def test_json_inf_nan_allow(float_value, encoded_str):
+    class R(RootModel[float]):
+        model_config = ConfigDict(ser_json_inf_nan='strings')
+
+    r = R(float_value)
+    r_encoded = f'"{encoded_str}"'
+    assert r.model_dump_json() == r_encoded
+    if math.isnan(float_value):
+        assert math.isnan(R.model_validate_json(r_encoded).root)
+    else:
+        assert R.model_validate_json(r_encoded) == r
+
+    class M(BaseModel):
+        f: float
+        model_config = R.model_config
+
+    m = M(f=float_value)
+    m_encoded = f'{{"f":{r_encoded}}}'
+    assert m.model_dump_json() == m_encoded
+    if math.isnan(float_value):
+        assert math.isnan(M.model_validate_json(m_encoded).f)
+    else:
+        assert M.model_validate_json(m_encoded) == m
+
+
+def test_json_bytes_base64_round_trip():
+    class R(RootModel[bytes]):
+        model_config = ConfigDict(ser_json_bytes='base64', val_json_bytes='base64')
+
+    r = R(b'hello')
+    r_encoded = '"aGVsbG8="'
+    assert r.model_dump_json() == r_encoded
+    assert R.model_validate_json(r_encoded) == r
+
+    class M(BaseModel):
+        key: bytes
+        model_config = R.model_config
+
+    m = M(key=b'hello')
+    m_encoded = f'{{"key":{r_encoded}}}'
+    assert m.model_dump_json() == m_encoded
+    assert M.model_validate_json(m_encoded) == m
+
+
+def test_json_bytes_hex_round_trip():
+    class R(RootModel[bytes]):
+        model_config = ConfigDict(ser_json_bytes='hex', val_json_bytes='hex')
+
+    r = R(b'hello')
+    r_encoded = '"68656c6c6f"'
+    assert r.model_dump_json() == r_encoded
+    assert R.model_validate_json(r_encoded) == r
+
+    class M(BaseModel):
+        key: bytes
+        model_config = R.model_config
+
+    m = M(key=b'hello')
+    m_encoded = f'{{"key":{r_encoded}}}'
+    assert m.model_dump_json() == m_encoded
+    assert M.model_validate_json(m_encoded) == m
+
+
+# Complete tests exist in pydantic-core:
+def test_json_ensure_ascii() -> None:
+    ta = TypeAdapter(str)
+
+    assert ta.dump_json('à', ensure_ascii=True) == b'"\\u00e0"'
+
+    class Model(BaseModel):
+        f: str
+
+    assert Model(f='à').model_dump_json(ensure_ascii=True) == '{"f":"\\u00e0"}'

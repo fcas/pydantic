@@ -1,4 +1,6 @@
-import importlib
+from __future__ import annotations
+
+import importlib.util
 import inspect
 import os
 import re
@@ -6,15 +8,20 @@ import secrets
 import subprocess
 import sys
 import textwrap
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from types import FunctionType
-from typing import Any, Optional
+from types import FunctionType, ModuleType
+from typing import Any
 
 import pytest
 from _pytest.assertion.rewrite import AssertionRewritingHook
+from _pytest.nodes import Item
+from typing_extensions import TypedDict
 
-from pydantic import GenerateSchema
+from pydantic import BaseModel
+from pydantic._internal._generate_schema import GenerateSchema
+from pydantic.json_schema import GenerateJsonSchema
 
 
 def pytest_addoption(parser: pytest.Parser):
@@ -22,7 +29,7 @@ def pytest_addoption(parser: pytest.Parser):
     parser.addoption('--update-mypy', action='store_true', help='update mypy tests')
 
 
-def _extract_source_code_from_function(function):
+def _extract_source_code_from_function(function: FunctionType):
     if function.__code__.co_argcount:
         raise RuntimeError(f'function {function.__qualname__} cannot have any arguments')
 
@@ -38,8 +45,12 @@ def _extract_source_code_from_function(function):
     return textwrap.dedent(code_lines)
 
 
-def _create_module_file(code, tmp_path, name):
-    name = f'{name}_{secrets.token_hex(5)}'
+def _create_module_file(code: str, tmp_path: Path, name: str) -> tuple[str, str]:
+    # Max path length in Windows is 260. Leaving some buffer here
+    max_name_len = 240 - len(str(tmp_path))
+    # Windows does not allow these characters in paths. Linux bans slashes only.
+    sanitized_name = re.sub('[' + re.escape('<>:"/\\|?*') + ']', '-', name)[:max_name_len]
+    name = f'{sanitized_name}_{secrets.token_hex(5)}'
     path = tmp_path / f'{name}.py'
     path.write_text(code)
     return name, str(path)
@@ -49,12 +60,18 @@ def _create_module_file(code, tmp_path, name):
 def disable_error_urls():
     # Don't add URLs during docs tests when printing
     # Otherwise we'll get version numbers in the URLs that will update frequently
-    os.environ['PYDANTIC_ERRORS_OMIT_URL'] = 'true'
+    os.environ['PYDANTIC_ERRORS_INCLUDE_URL'] = 'false'
 
 
 @pytest.fixture
-def create_module(tmp_path, request):
-    def run(source_code_or_function, rewrite_assertions=True, module_name_prefix=None):
+def create_module(
+    tmp_path: Path, request: pytest.FixtureRequest
+) -> Callable[[FunctionType | str, bool, str | None], ModuleType]:
+    def run(
+        source_code_or_function: FunctionType | str,
+        rewrite_assertions: bool = True,
+        module_name_prefix: str | None = None,
+    ) -> ModuleType:
         """
         Create module object, execute it and return
         Can be used as a decorator of the function from the source code of which the module will be constructed
@@ -80,8 +97,8 @@ def create_module(tmp_path, request):
             loader = None
 
         spec = importlib.util.spec_from_file_location(module_name, filename, loader=loader)
-        sys.modules[module_name] = module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        sys.modules[module_name] = module = importlib.util.module_from_spec(spec)  # pyright: ignore[reportArgumentType]
+        spec.loader.exec_module(module)  # pyright: ignore[reportOptionalMemberAccess]
         return module
 
     return run
@@ -89,6 +106,9 @@ def create_module(tmp_path, request):
 
 @pytest.fixture
 def subprocess_run_code(tmp_path: Path):
+    if sys.platform == 'emscripten':
+        pytest.skip('No subprocess support in emscripten')
+
     def run_code(source_code_or_function) -> str:
         if isinstance(source_code_or_function, FunctionType):
             source_code = _extract_source_code_from_function(source_code_or_function)
@@ -106,7 +126,7 @@ def subprocess_run_code(tmp_path: Path):
 @dataclass
 class Err:
     message: str
-    errors: Optional[Any] = None
+    errors: Any | None = None
 
     def __repr__(self):
         if self.errors:
@@ -127,7 +147,7 @@ class CallCounter:
 
 
 @pytest.fixture
-def generate_schema_calls(monkeypatch) -> CallCounter:
+def generate_schema_calls(monkeypatch: pytest.MonkeyPatch) -> CallCounter:
     orig_generate_schema = GenerateSchema.generate_schema
     counter = CallCounter()
     depth = 0  # generate_schema can be called recursively
@@ -143,3 +163,66 @@ def generate_schema_calls(monkeypatch) -> CallCounter:
 
     monkeypatch.setattr(GenerateSchema, 'generate_schema', generate_schema_call_counter)
     return counter
+
+
+@pytest.fixture(scope='function', autouse=True)
+def validate_json_schemas(monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest) -> None:
+    orig_generate = GenerateJsonSchema.generate
+
+    if sys.platform != 'emscripten':
+        # Until https://github.com/pyodide/pyodide/issues/6234 is fixed:
+
+        from jsonschema import Draft202012Validator, SchemaError
+
+        def generate(*args: Any, **kwargs: Any) -> Any:
+            json_schema = orig_generate(*args, **kwargs)
+            if not request.node.get_closest_marker('skip_json_schema_validation'):
+                try:
+                    Draft202012Validator.check_schema(json_schema)
+                except SchemaError:
+                    pytest.fail(
+                        'Failed to validate the JSON Schema against the Draft 2020-12 spec. '
+                        'If this is expected, you can mark the test function with the `skip_json_schema_validation` '
+                        'marker. Note that this validation only takes place during tests, and is not active at runtime.'
+                    )
+
+            return json_schema
+
+        monkeypatch.setattr(GenerateJsonSchema, 'generate', generate)
+
+
+class AutoDataclass:
+    def __init_subclass__(cls) -> None:
+        super().__init_subclass__()
+        dataclass()(cls)
+
+
+@pytest.fixture(params=['model', 'typed_dict', 'dataclass'])
+def container_class(request: pytest.FixtureRequest) -> type[Any]:
+    if request.param == 'model':
+        return BaseModel
+    elif request.param == 'typed_dict':
+        return TypedDict
+    else:
+        return AutoDataclass
+
+
+_thread_unsafe_fixtures = (
+    'generate_schema_calls',  # Monkeypatches Pydantic code
+    'benchmark',  # Fixture can't be reused
+    'tmp_path',  # Duplicate paths
+    'tmpdir',  # Duplicate dirs
+    'copy_method',  # Uses `pytest.warns()`
+    'reset_plugins',  # Monkeypatching
+)
+
+
+# Note: it is important to add the marker in the `pytest_itemcollected` hook.
+# `pytest-run-parallel` also implements this hook (and ours is running before),
+# and this wouldn't work if we were to add the "thread_unsafe" marker in say
+# `pytest_collection_modifyitems` (which is the last collection hook to be run).
+def pytest_itemcollected(item: Item) -> None:
+    """Mark tests as thread unsafe if they make use of fixtures that doesn't play well across threads."""
+    fixtures: tuple[str, ...] = getattr(item, 'fixturenames', ())
+    if any(fixture in fixtures for fixture in _thread_unsafe_fixtures):
+        item.add_marker('thread_unsafe')

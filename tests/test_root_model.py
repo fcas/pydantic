@@ -1,11 +1,13 @@
+import importlib.util
+import inspect
 import pickle
+import typing
 from datetime import date, datetime
-from typing import Any, Dict, Generic, List, Optional, Union
+from typing import Annotated, Any, Generic, Literal, TypeVar
 
 import pytest
 from pydantic_core import CoreSchema
 from pydantic_core.core_schema import SerializerFunctionWrapHandler
-from typing_extensions import Annotated, Literal, TypeVar
 
 from pydantic import (
     Base64Str,
@@ -32,8 +34,8 @@ def parametrize_root_model():
         [
             pytest.param(int, 42, 42, id='int'),
             pytest.param(str, 'forty two', 'forty two', id='str'),
-            pytest.param(Dict[int, bool], {1: True, 2: False}, {1: True, 2: False}, id='dict[int, bool]'),
-            pytest.param(List[int], [4, 2, -1], [4, 2, -1], id='list[int]'),
+            pytest.param(dict[int, bool], {1: True, 2: False}, {1: True, 2: False}, id='dict[int, bool]'),
+            pytest.param(list[int], [4, 2, -1], [4, 2, -1], id='list[int]'),
             pytest.param(
                 InnerModel,
                 InnerModel(int_field=42, str_field='forty two'),
@@ -90,7 +92,7 @@ def test_root_model_validation_error():
         {
             'input': 'forty two',
             'loc': (),
-            'msg': 'Input should be a valid integer, unable to parse string as an ' 'integer',
+            'msg': 'Input should be a valid integer, unable to parse string as an integer',
             'type': 'int_parsing',
         },
     ]
@@ -111,11 +113,11 @@ def test_root_model_repr():
 
 
 def test_root_model_recursive():
-    class A(RootModel[List['B']]):
+    class A(RootModel[list['B']]):
         def my_a_method(self):
             pass
 
-    class B(RootModel[Dict[str, Optional[A]]]):
+    class B(RootModel[dict[str, A | None]]):
         def my_b_method(self):
             pass
 
@@ -182,7 +184,7 @@ def test_construct():
         pass
 
     v = Base64Root.model_construct('test')
-    assert v.model_dump() == 'dGVzdA==\n'
+    assert v.model_dump() == 'dGVzdA=='
 
 
 def test_construct_nested():
@@ -190,13 +192,14 @@ def test_construct_nested():
         data: RootModel[Base64Str]
 
     v = Base64RootProperty.model_construct(data=RootModel[Base64Str].model_construct('test'))
-    assert v.model_dump() == {'data': 'dGVzdA==\n'}
+    assert v.model_dump() == {'data': 'dGVzdA=='}
 
     # Note: model_construct requires the inputs to be valid; the root model value does not get "validated" into
     # an actual root model instance:
     v = Base64RootProperty.model_construct(data='test')
     assert isinstance(v.data, str)  # should be RootModel[Base64Str], but model_construct skipped validation
-    with pytest.raises(AttributeError, match="'str' object has no attribute 'root'"):
+
+    with pytest.warns(UserWarning):
         v.model_dump()
 
 
@@ -475,12 +478,12 @@ def test_root_model_dump_with_base_model(order):
     if order == 'BR':
 
         class Model(RootModel):
-            root: List[Union[BModel, RModel]]
+            root: list[BModel | RModel]
 
     elif order == 'RB':
 
         class Model(RootModel):
-            root: List[Union[RModel, BModel]]
+            root: list[RModel | BModel]
 
     m = Model([1, 2, {'value': 'abc'}])
 
@@ -509,10 +512,18 @@ def test_mixed_discriminated_union(data):
         str_value: str
 
     class Model(RootModel):
-        root: Union[SModel, RModel] = Field(discriminator='kind')
+        root: SModel | RModel = Field(discriminator='kind')
 
-    assert Model(data).model_dump() == data
-    assert Model(**data).model_dump() == data
+    if data['kind'] == 'IModel':
+        with pytest.warns(
+            UserWarning,
+            match='Defaulting to left to right union serialization - failed to get discriminator value for tagged union serialization',
+        ):
+            assert Model(data).model_dump() == data
+            assert Model(**data).model_dump() == data
+    else:
+        assert Model(data).model_dump() == data
+        assert Model(**data).model_dump() == data
 
 
 def test_list_rootmodel():
@@ -524,10 +535,10 @@ def test_list_rootmodel():
         type: Literal['b']
         b: str
 
-    class D(RootModel[Annotated[Union[A, B], Field(discriminator='type')]]):
+    class D(RootModel[Annotated[A | B, Field(discriminator='type')]]):
         pass
 
-    LD = RootModel[List[D]]
+    LD = RootModel[list[D]]
 
     obj = LD.model_validate([{'type': 'a', 'a': 'a'}, {'type': 'b', 'b': 'b'}])
     assert obj.model_dump() == [{'type': 'a', 'a': 'a'}, {'type': 'b', 'b': 'b'}]
@@ -607,13 +618,46 @@ help_result_string = pydoc.render_doc(RootModel)
 
 
 def test_copy_preserves_equality():
-    model = RootModel()
+    class Root(RootModel[int]):
+        pass
 
-    copied = model.__copy__()
-    assert model == copied
+    root_model = Root(1)
 
-    deepcopied = model.__deepcopy__()
-    assert model == deepcopied
+    copied = root_model.model_copy()
+    assert root_model == copied
+
+    deepcopied = root_model.model_copy(deep=True)
+    assert root_model == deepcopied
+
+
+def test_root_model_shallow_copy() -> None:
+    class ListRootModel(RootModel[list[int]]):
+        pass
+
+    original = ListRootModel([1, 2, 3])
+    copied = original.model_copy(deep=False)
+
+    assert original is not copied
+    # Root value is also shallow copied, see https://github.com/pydantic/pydantic/issues/12543:
+    assert original.root is not copied.root
+    assert original.root == copied.root
+
+    copied.root.append(4)
+    assert original.root == [1, 2, 3]
+    assert copied.root == [1, 2, 3, 4]
+
+
+def test_root_model_deep_copy() -> None:
+    class NestedListRootModel(RootModel[list[list[int]]]):
+        pass
+
+    original = NestedListRootModel([[1, 2], [3, 4]])
+    copied = original.model_copy(deep=True)
+
+    assert original is not copied
+    assert original.root is not copied.root
+    assert original.root[0] is not copied.root[0]
+    assert original.root == copied.root
 
 
 @pytest.mark.parametrize(
@@ -657,7 +701,7 @@ def test_model_construction_with_invalid_generic_specification() -> None:
     with pytest.raises(TypeError, match='You should parametrize RootModel directly'):
 
         class GenericRootModel(RootModel, Generic[T_]):
-            root: Union[T_, int]
+            root: T_ | int
 
 
 def test_model_with_field_description() -> None:
@@ -680,3 +724,29 @@ def test_model_with_both_docstring_and_field_description() -> None:
         'type': 'integer',
         'description': 'More detailed description',
     }
+
+
+def test_type_checking_model_dump_signature_in_sync_with_base_model() -> None:
+
+    import pydantic.root_model
+
+    spec = importlib.util.spec_from_file_location('pydantic._root_model_type_checking', pydantic.root_model.__file__)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+
+    typing.TYPE_CHECKING = True
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        typing.TYPE_CHECKING = False
+
+    base_sig = inspect.signature(BaseModel.model_dump)
+    root_sig = inspect.signature(module.RootModel.model_dump)
+
+    # The return annotation intentionally differs (`Any` instead of `dict[str, Any]`),
+    # but the parameters must match exactly:
+    assert list(root_sig.parameters.values()) == list(base_sig.parameters.values())
+
+    assert module.RootModel.model_dump.__doc__ is not None
+    assert BaseModel.model_dump.__doc__ is not None
+    assert inspect.cleandoc(module.RootModel.model_dump.__doc__) == inspect.cleandoc(BaseModel.model_dump.__doc__)

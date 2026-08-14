@@ -2,48 +2,57 @@ import functools
 import importlib.util
 import re
 import sys
+import typing
 from abc import ABC, abstractmethod
-from collections.abc import Hashable
+from collections.abc import Callable, Hashable, Sequence
 from decimal import Decimal
 from enum import Enum, auto
 from typing import (
+    Annotated,
     Any,
-    Dict,
     ForwardRef,
-    FrozenSet,
     Generic,
-    List,
+    Literal,
     Optional,
-    Sequence,
-    Set,
-    Tuple,
-    Type,
     TypeVar,
     Union,
 )
 
 import pytest
 from dirty_equals import HasRepr, IsStr
-from pydantic_core import ErrorDetails, InitErrorDetails, PydanticSerializationError, core_schema
-from typing_extensions import Annotated, Literal, TypedDict, get_args
+from pydantic_core import (
+    CoreSchema,
+    ErrorDetails,
+    InitErrorDetails,
+    PydanticSerializationError,
+    PydanticUndefined,
+    core_schema,
+)
+from typing_extensions import Self, TypeAliasType, TypedDict, get_args  # noqa: UP035 (for `get_args`)
 
 from pydantic import (
+    AfterValidator,
     BaseModel,
     ConfigDict,
     GetCoreSchemaHandler,
+    PrivateAttr,
     PydanticDeprecatedSince20,
-    PydanticInvalidForJsonSchema,
     PydanticSchemaGenerationError,
+    PydanticUndefinedAnnotation,
+    PydanticUserError,
     RootModel,
     TypeAdapter,
     ValidationError,
     constr,
+    create_model,
     errors,
     field_validator,
     model_validator,
     root_validator,
     validator,
 )
+from pydantic._internal._model_construction import ModelMetaclass
+from pydantic._internal._typing_extra import safe_get_annotations
 from pydantic.fields import Field, computed_field
 from pydantic.functional_serializers import (
     field_serializer,
@@ -53,11 +62,11 @@ from pydantic.functional_serializers import (
 
 def test_str_bytes():
     class Model(BaseModel):
-        v: Union[str, bytes]
+        v: str | bytes
 
     m = Model(v='s')
     assert m.v == 's'
-    assert repr(m.model_fields['v']) == 'FieldInfo(annotation=Union[str, bytes], required=True)'
+    assert repr(Model.model_fields['v']) == 'FieldInfo(annotation=Union[str, bytes], required=True)'
 
     m = Model(v=b'b')
     assert m.v == b'b'
@@ -73,7 +82,7 @@ def test_str_bytes():
 
 def test_str_bytes_none():
     class Model(BaseModel):
-        v: Union[None, str, bytes] = ...
+        v: None | str | bytes = ...
 
     m = Model(v='s')
     assert m.v == 's'
@@ -87,7 +96,7 @@ def test_str_bytes_none():
 
 def test_union_int_str():
     class Model(BaseModel):
-        v: Union[int, str] = ...
+        v: int | str = ...
 
     m = Model(v=123)
     assert m.v == 123
@@ -117,7 +126,7 @@ def test_union_int_str():
 
 def test_union_int_any():
     class Model(BaseModel):
-        v: Union[int, Any]
+        v: int | Any
 
     m = Model(v=123)
     assert m.v == 123
@@ -134,7 +143,7 @@ def test_union_int_any():
 
 def test_typed_list():
     class Model(BaseModel):
-        v: List[int] = ...
+        v: list[int] = ...
 
     m = Model(v=[1, 2, '3'])
     assert m.v == [1, 2, 3]
@@ -167,7 +176,7 @@ def test_typed_list():
 
 def test_typed_set():
     class Model(BaseModel):
-        v: Set[int] = ...
+        v: set[int] = ...
 
     assert Model(v={1, 2, '3'}).v == {1, 2, 3}
     assert Model(v=[1, 2, '3']).v == {1, 2, 3}
@@ -187,14 +196,14 @@ def test_typed_set():
 
 def test_dict_dict():
     class Model(BaseModel):
-        v: Dict[str, int] = ...
+        v: dict[str, int] = ...
 
     assert Model(v={'foo': 1}).model_dump() == {'v': {'foo': 1}}
 
 
 def test_none_list():
     class Model(BaseModel):
-        v: List[None] = [None]
+        v: list[None] = [None]
 
     assert Model.model_json_schema() == {
         'title': 'Model',
@@ -213,7 +222,7 @@ def test_none_list():
 )
 def test_typed_dict(value, result):
     class Model(BaseModel):
-        v: Dict[str, int] = ...
+        v: dict[str, int] = ...
 
     assert Model(v=value).v == result
 
@@ -241,7 +250,7 @@ def test_typed_dict(value, result):
 )
 def test_typed_dict_error(value, errors):
     class Model(BaseModel):
-        v: Dict[str, int] = ...
+        v: dict[str, int] = ...
 
     with pytest.raises(ValidationError) as exc_info:
         Model(v=value)
@@ -250,7 +259,7 @@ def test_typed_dict_error(value, errors):
 
 def test_dict_key_error():
     class Model(BaseModel):
-        v: Dict[int, int] = ...
+        v: dict[int, int] = ...
 
     assert Model(v={1: 2, '3': '4'}).v == {1: 2, 3: 4}
 
@@ -269,7 +278,7 @@ def test_dict_key_error():
 
 def test_tuple():
     class Model(BaseModel):
-        v: Tuple[int, float, bool]
+        v: tuple[int, float, bool]
 
     m = Model(v=['1.0', '2.2', 'true'])
     assert m.v == (1, 2.2, True)
@@ -277,10 +286,10 @@ def test_tuple():
 
 def test_tuple_more():
     class Model(BaseModel):
-        empty_tuple: Tuple[()]
+        empty_tuple: tuple[()]
         simple_tuple: tuple = None
-        tuple_of_different_types: Tuple[int, float, str, bool] = None
-        tuple_of_single_tuples: Tuple[Tuple[int], ...] = ()
+        tuple_of_different_types: tuple[int, float, str, bool] = None
+        tuple_of_single_tuples: tuple[tuple[int], ...] = ()
 
     m = Model(
         empty_tuple=[],
@@ -299,7 +308,7 @@ def test_tuple_more():
 @pytest.mark.parametrize(
     'dict_cls,frozenset_cls,list_cls,set_cls,tuple_cls,type_cls',
     [
-        (Dict, FrozenSet, List, Set, Tuple, Type),
+        (typing.Dict, typing.FrozenSet, typing.List, typing.Set, typing.Tuple, typing.Type),  # noqa: UP006
         (dict, frozenset, list, set, tuple, type),
     ],
 )
@@ -312,19 +321,19 @@ def test_pep585_generic_types(dict_cls, frozenset_cls, list_cls, set_cls, tuple_
 
     class Model(BaseModel, arbitrary_types_allowed=True):
         a: dict_cls
-        a1: 'dict_cls[str, int]'
+        a1: dict_cls[str, int]
         b: frozenset_cls
-        b1: 'frozenset_cls[int]'
+        b1: frozenset_cls[int]
         c: list_cls
-        c1: 'list_cls[int]'
+        c1: list_cls[int]
         d: set_cls
-        d1: 'set_cls[int]'
+        d1: set_cls[int]
         e: tuple_cls
-        e1: 'tuple_cls[int]'
-        e2: 'tuple_cls[int, ...]'
-        e3: 'tuple_cls[()]'
+        e1: tuple_cls[int]
+        e2: tuple_cls[int, ...]
+        e3: tuple_cls[()]
         f: type_cls
-        f1: 'type_cls[Type1]'
+        f1: type_cls[Type1]
 
     default_model_kwargs = dict(
         a={},
@@ -390,8 +399,8 @@ def test_pep585_generic_types(dict_cls, frozenset_cls, list_cls, set_cls, tuple_
 
 def test_tuple_length_error():
     class Model(BaseModel):
-        v: Tuple[int, float, bool]
-        w: Tuple[()]
+        v: tuple[int, float, bool]
+        w: tuple[()]
 
     with pytest.raises(ValidationError) as exc_info:
         Model(v=[1, 2], w=[1])
@@ -410,7 +419,7 @@ def test_tuple_length_error():
 
 def test_tuple_invalid():
     class Model(BaseModel):
-        v: Tuple[int, float, bool]
+        v: tuple[int, float, bool]
 
     with pytest.raises(ValidationError) as exc_info:
         Model(v='xxx')
@@ -421,7 +430,7 @@ def test_tuple_invalid():
 
 def test_tuple_value_error():
     class Model(BaseModel):
-        v: Tuple[int, float, Decimal]
+        v: tuple[int, float, Decimal]
 
     with pytest.raises(ValidationError) as exc_info:
         Model(v=['x', 'y', 'x'])
@@ -454,7 +463,7 @@ def test_recursive_list():
         count: int = None
 
     class Model(BaseModel):
-        v: List[SubModel] = []
+        v: list[SubModel] = []
 
     m = Model(v=[])
     assert m.v == []
@@ -485,7 +494,7 @@ def test_recursive_list_error():
         count: int = None
 
     class Model(BaseModel):
-        v: List[SubModel] = []
+        v: list[SubModel] = []
 
     with pytest.raises(ValidationError) as exc_info:
         Model(v=[{}])
@@ -496,25 +505,32 @@ def test_recursive_list_error():
 
 def test_list_unions():
     class Model(BaseModel):
-        v: List[Union[int, str]] = ...
+        v: list[int | str]
 
     assert Model(v=[123, '456', 'foobar']).v == [123, '456', 'foobar']
 
     with pytest.raises(ValidationError) as exc_info:
         Model(v=[1, 2, None])
 
-    assert exc_info.value.errors(include_url=False) == [
+    # the reason that we need to do an unordered list comparison here is that previous tests use Union[str, int]
+    # and Python's cache makes it such that the above Model has `v` associated with a list[Union[str, int]] instead
+    # of the expected list[Union[int, str]]
+    # for more info, see  https://github.com/python/cpython/issues/103749 and
+    # https://github.com/pydantic/pydantic/pull/10244#issuecomment-2312796647
+    errors = exc_info.value.errors(include_url=False)
+    expected_errors = [
         {'input': None, 'loc': ('v', 2, 'int'), 'msg': 'Input should be a valid integer', 'type': 'int_type'},
         {'input': None, 'loc': ('v', 2, 'str'), 'msg': 'Input should be a valid string', 'type': 'string_type'},
     ]
+    assert sorted(errors, key=str) == sorted(expected_errors, key=str)
 
 
 def test_recursive_lists():
     class Model(BaseModel):
-        v: List[List[Union[int, float]]] = ...
+        v: list[list[int | float]] = ...
 
     assert Model(v=[[1, 2], [3, '4', '4.1']]).v == [[1, 2], [3, 4, 4.1]]
-    assert Model.model_fields['v'].annotation == List[List[Union[int, float]]]
+    assert Model.model_fields['v'].annotation == list[list[int | float]]
     assert Model.model_fields['v'].is_required()
 
 
@@ -535,7 +551,7 @@ def test_str_enum():
 
 def test_any_dict():
     class Model(BaseModel):
-        v: Dict[int, Any] = ...
+        v: dict[int, Any] = ...
 
     assert Model(v={1: 'foobar'}).model_dump() == {'v': {1: 'foobar'}}
     assert Model(v={123: 456}).model_dump() == {'v': {123: 456}}
@@ -622,7 +638,7 @@ def test_advanced_exclude():
 
     class SubModel(BaseModel):
         c: str
-        d: List[SubSubModel]
+        d: list[SubSubModel]
 
     class Model(BaseModel):
         e: str
@@ -640,15 +656,15 @@ def test_advanced_exclude():
 def test_advanced_exclude_by_alias():
     class SubSubModel(BaseModel):
         a: str
-        aliased_b: str = Field(..., alias='b_alias')
+        aliased_b: str = Field(alias='b_alias')
 
     class SubModel(BaseModel):
-        aliased_c: str = Field(..., alias='c_alias')
-        aliased_d: List[SubSubModel] = Field(..., alias='d_alias')
+        aliased_c: str = Field(alias='c_alias')
+        aliased_d: list[SubSubModel] = Field(alias='d_alias')
 
     class Model(BaseModel):
-        aliased_e: str = Field(..., alias='e_alias')
-        aliased_f: SubModel = Field(..., alias='f_alias')
+        aliased_e: str = Field(alias='e_alias')
+        aliased_f: SubModel = Field(alias='f_alias')
 
     m = Model(
         e_alias='e',
@@ -672,7 +688,7 @@ def test_advanced_value_include():
 
     class SubModel(BaseModel):
         c: str
-        d: List[SubSubModel]
+        d: list[SubSubModel]
 
     class Model(BaseModel):
         e: str
@@ -692,7 +708,7 @@ def test_advanced_value_exclude_include():
 
     class SubModel(BaseModel):
         c: str
-        d: List[SubSubModel]
+        d: list[SubSubModel]
 
     class Model(BaseModel):
         e: str
@@ -790,10 +806,10 @@ def test_advanced_exclude_nested_lists(exclude, expected):
 
     class SubModel(BaseModel):
         k: int
-        subsubs: List[SubSubModel]
+        subsubs: list[SubSubModel]
 
     class Model(BaseModel):
-        subs: List[SubModel]
+        subs: list[SubModel]
 
     m = Model(subs=[dict(k=1, subsubs=[dict(i=1, j=1), dict(i=2, j=2)]), dict(k=2, subsubs=[dict(i=3, j=3)])])
 
@@ -851,17 +867,17 @@ def test_advanced_exclude_nested_lists(exclude, expected):
         pytest.param(
             {'subs': {'__all__': {'subsubs': {'__all__': {'i'}, 0: {'j'}}}}},
             {'subs': [{'subsubs': [{'i': 1, 'j': 1}, {'i': 2}]}, {'subsubs': [{'i': 3, 'j': 3}]}]},
-            id='Nested different keys 1',
+            id='Nested different keys 4',
         ),
         pytest.param(
             {'subs': {'__all__': {'subsubs': {'__all__': {'i': ...}, 0: {'j'}}}}},
             {'subs': [{'subsubs': [{'i': 1, 'j': 1}, {'i': 2}]}, {'subsubs': [{'i': 3, 'j': 3}]}]},
-            id='Nested different keys 2',
+            id='Nested different keys 5',
         ),
         pytest.param(
             {'subs': {'__all__': {'subsubs': {'__all__': {'i'}, 0: {'j': ...}}}}},
             {'subs': [{'subsubs': [{'i': 1, 'j': 1}, {'i': 2}]}, {'subsubs': [{'i': 3, 'j': 3}]}]},
-            id='Nested different keys 3',
+            id='Nested different keys 6',
         ),
         pytest.param(
             {'subs': {'__all__': {'subsubs'}, 0: {'subsubs': {'__all__': {'j'}}}}},
@@ -887,10 +903,10 @@ def test_advanced_include_nested_lists(include, expected):
 
     class SubModel(BaseModel):
         k: int
-        subsubs: List[SubSubModel]
+        subsubs: list[SubSubModel]
 
     class Model(BaseModel):
-        subs: List[SubModel]
+        subs: list[SubModel]
 
     m = Model(subs=[dict(k=1, subsubs=[dict(i=1, j=1), dict(i=2, j=2)]), dict(k=2, subsubs=[dict(i=3, j=3)])])
 
@@ -959,7 +975,7 @@ def test_inheritance():
         a: float = ...
 
     with pytest.raises(
-        TypeError,
+        PydanticUserError,
         match=(
             "Field 'a' defined on a base class was overridden by a non-annotated attribute. "
             'All field definitions, including overrides, require a type annotation.'
@@ -1124,7 +1140,7 @@ def test_annotation_inheritance():
     assert C.model_fields['integer'].annotation == str
 
     with pytest.raises(
-        TypeError,
+        PydanticUserError,
         match=(
             "Field 'integer' defined on a base class was overridden by a non-annotated attribute. "
             'All field definitions, including overrides, require a type annotation.'
@@ -1150,7 +1166,7 @@ def test_string_none():
 # def test_return_errors_ok():
 #     class Model(BaseModel):
 #         foo: int
-#         bar: List[int]
+#         bar: list[int]
 #
 #     assert validate_model(Model, {'foo': '123', 'bar': (1, 2, 3)}) == (
 #         {'foo': 123, 'bar': [1, 2, 3]},
@@ -1166,7 +1182,7 @@ def test_string_none():
 # def test_return_errors_error():
 #     class Model(BaseModel):
 #         foo: int
-#         bar: List[int]
+#         bar: list[int]
 #
 #     d, f, e = validate_model(Model, {'foo': '123', 'bar': (1, 2, 'x')}, False)
 #     assert d == {'foo': 123}
@@ -1181,7 +1197,7 @@ def test_string_none():
 
 def test_optional_required():
     class Model(BaseModel):
-        bar: Optional[int]
+        bar: int | None
 
     assert Model(bar=123).model_dump() == {'bar': 123}
     assert Model(bar=None).model_dump() == {'bar': None}
@@ -1209,7 +1225,7 @@ def test_unable_to_infer():
 
 def test_multiple_errors():
     class Model(BaseModel):
-        a: Union[None, int, float, Decimal]
+        a: None | int | float | Decimal
 
     with pytest.raises(ValidationError) as exc_info:
         Model(a='foobar')
@@ -1332,6 +1348,22 @@ def test_custom_init():
     assert Model.model_validate({'x': 1, 'y': 'abc'}).x == 4
 
 
+def test_custom_init_validate_strings() -> None:
+    """https://github.com/pydantic/pydantic/issues/12718."""
+    calls: list[dict[str, object]] = []
+
+    class Model(BaseModel):
+        x: int
+
+        def __init__(self, **data: object) -> None:
+            calls.append(data)
+            super().__init__(**data)
+
+    Model.model_validate_strings({'x': '1'})
+
+    assert calls == [{'x': '1'}]
+
+
 def test_nested_custom_init():
     class NestedModel(BaseModel):
         self: str
@@ -1374,20 +1406,113 @@ def test_type_on_annotation():
         pass
 
     class Model(BaseModel):
-        a: Type[int]
-        b: Type[int] = int
-        c: Type[FooBar]
-        d: Type[FooBar] = FooBar
-        e: Sequence[Type[FooBar]] = [FooBar]
-        f: Union[Type[FooBar], Sequence[Type[FooBar]]] = FooBar
-        g: Union[Type[FooBar], Sequence[Type[FooBar]]] = [FooBar]
+        a: type[int]
+        b: type[int] = int
+        c: type[FooBar]
+        d: type[FooBar] = FooBar
+        e: Sequence[type[FooBar]] = [FooBar]
+        f: type[FooBar] | Sequence[type[FooBar]] = FooBar
+        g: type[FooBar] | Sequence[type[FooBar]] = [FooBar]
 
-        model_config = dict(arbitrary_types_allowed=True)
+        model_config = {'arbitrary_types_allowed': True}
 
     assert Model.model_fields.keys() == set('abcdefg')
 
 
-def test_assign_type():
+def test_type_union():
+    class Model(BaseModel):
+        a: type[str | bytes]
+        b: type[Any | str]
+
+    m = Model(a=bytes, b=int)
+    assert m.model_dump() == {'a': bytes, 'b': int}
+    assert m.a == bytes
+
+
+def test_type_on_none():
+    class Model(BaseModel):
+        a: type[None]
+
+    Model(a=type(None))
+
+    with pytest.raises(ValidationError) as exc_info:
+        Model(a=None)
+
+    assert exc_info.value.errors(include_url=False) == [
+        {
+            'type': 'is_subclass_of',
+            'loc': ('a',),
+            'msg': 'Input should be a subclass of NoneType',
+            'input': None,
+            'ctx': {'class': 'NoneType'},
+        }
+    ]
+
+
+def test_type_on_typealias():
+    Float = TypeAliasType('Float', float)
+
+    class MyFloat(float): ...
+
+    adapter = TypeAdapter(type[Float])
+
+    adapter.validate_python(float)
+    adapter.validate_python(MyFloat)
+
+    with pytest.raises(ValidationError) as exc_info:
+        adapter.validate_python(str)
+
+    assert exc_info.value.errors(include_url=False) == [
+        {
+            'type': 'is_subclass_of',
+            'loc': (),
+            'msg': 'Input should be a subclass of float',
+            'input': str,
+            'ctx': {'class': 'float'},
+        }
+    ]
+
+
+def test_type_on_annotated():
+    class Model(BaseModel):
+        a: type[Annotated[int, ...]]
+
+    Model(a=int)
+
+    with pytest.raises(ValidationError) as exc_info:
+        Model(a=str)
+
+    assert exc_info.value.errors(include_url=False) == [
+        {
+            'type': 'is_subclass_of',
+            'loc': ('a',),
+            'msg': 'Input should be a subclass of int',
+            'input': str,
+            'ctx': {'class': 'int'},
+        }
+    ]
+
+
+def test_type_on_generic_alias() -> None:
+    error_msg = 'Instead of using type[list[int]], use type[list].'
+
+    with pytest.raises(PydanticUserError, check=lambda e: error_msg in e.message):
+
+        class Model(BaseModel):
+            a: type[list[int]]
+
+
+def test_typing_type_on_generic_alias() -> None:
+    error_msg = 'Instead of using type[typing.List[int]], use type[list].'
+
+    with pytest.raises(PydanticUserError, check=lambda e: error_msg in e.message):
+        # Note: this only works with typing.List, list behaves differently in Python 3.9 and sometimes 3.10,
+        # so thus we use typing.List here.
+        class Model(BaseModel):
+            a: type[typing.List[int]]  # noqa: UP006
+
+
+def test_type_assign():
     class Parent:
         def echo(self):
             return 'parent'
@@ -1401,7 +1526,7 @@ def test_assign_type():
             return 'different'
 
     class Model(BaseModel):
-        v: Type[Parent] = Parent
+        v: type[Parent] = Parent
 
     assert Model(v=Parent).v().echo() == 'parent'
     assert Model().v().echo() == 'parent'
@@ -1410,10 +1535,10 @@ def test_assign_type():
         Model(v=Different)
     assert exc_info.value.errors(include_url=False) == [
         {
-            'ctx': {'class': 'test_assign_type.<locals>.Parent'},
-            'input': HasRepr("<class 'tests.test_edge_cases.test_assign_type.<locals>.Different'>"),
+            'ctx': {'class': Parent.__qualname__},
+            'input': HasRepr(repr(Different)),
             'loc': ('v',),
-            'msg': 'Input should be a subclass of test_assign_type.<locals>.Parent',
+            'msg': f'Input should be a subclass of {Parent.__qualname__}',
             'type': 'is_subclass_of',
         }
     ]
@@ -1421,9 +1546,9 @@ def test_assign_type():
 
 def test_optional_subfields():
     class Model(BaseModel):
-        a: Optional[int]
+        a: int | None
 
-    assert Model.model_fields['a'].annotation == Optional[int]
+    assert Model.model_fields['a'].annotation == int | None
 
     with pytest.raises(ValidationError) as exc_info:
         Model(a='foobar')
@@ -1431,7 +1556,7 @@ def test_optional_subfields():
         {
             'input': 'foobar',
             'loc': ('a',),
-            'msg': 'Input should be a valid integer, unable to parse string as an ' 'integer',
+            'msg': 'Input should be a valid integer, unable to parse string as an integer',
             'type': 'int_parsing',
         }
     ]
@@ -1448,14 +1573,14 @@ def test_optional_subfields():
 
 def test_validated_optional_subfields():
     class Model(BaseModel):
-        a: Optional[int]
+        a: int | None
 
         @field_validator('a')
         @classmethod
         def check_a(cls, v):
             return v
 
-    assert Model.model_fields['a'].annotation == Optional[int]
+    assert Model.model_fields['a'].annotation == int | None
 
     with pytest.raises(ValidationError) as exc_info:
         Model(a='foobar')
@@ -1463,7 +1588,7 @@ def test_validated_optional_subfields():
         {
             'input': 'foobar',
             'loc': ('a',),
-            'msg': 'Input should be a valid integer, unable to parse string as an ' 'integer',
+            'msg': 'Input should be a valid integer, unable to parse string as an integer',
             'type': 'int_parsing',
         }
     ]
@@ -1480,7 +1605,7 @@ def test_validated_optional_subfields():
 
 def test_optional_field_constraints():
     class MyModel(BaseModel):
-        my_int: Optional[int] = Field(..., ge=3)
+        my_int: int | None = Field(ge=3)
 
     with pytest.raises(ValidationError) as exc_info:
         MyModel(my_int=2)
@@ -1497,10 +1622,10 @@ def test_optional_field_constraints():
 
 def test_field_str_shape():
     class Model(BaseModel):
-        a: List[int]
+        a: list[int]
 
-    assert repr(Model.model_fields['a']) == 'FieldInfo(annotation=List[int], required=True)'
-    assert str(Model.model_fields['a']) == 'annotation=List[int] required=True'
+    assert repr(Model.model_fields['a']) == 'FieldInfo(annotation=list[int], required=True)'
+    assert str(Model.model_fields['a']) == 'annotation=list[int] required=True'
 
 
 T1 = TypeVar('T1')
@@ -1517,28 +1642,19 @@ class DisplayGen(Generic[T1, T2]):
     'type_,expected',
     [
         (int, 'int'),
-        (Optional[int], 'Union[int, NoneType]'),
-        (Union[None, int, str], 'Union[NoneType, int, str]'),
-        (Union[int, str, bytes], 'Union[int, str, bytes]'),
-        (List[int], 'List[int]'),
-        (Tuple[int, str, bytes], 'Tuple[int, str, bytes]'),
-        (Union[List[int], Set[bytes]], 'Union[List[int], Set[bytes]]'),
-        (List[Tuple[int, int]], 'List[Tuple[int, int]]'),
-        (Dict[int, str], 'Dict[int, str]'),
-        (FrozenSet[int], 'FrozenSet[int]'),
-        (Tuple[int, ...], 'Tuple[int, ...]'),
-        (Optional[List[int]], 'Union[List[int], NoneType]'),
+        pytest.param(Optional[int], 'Union[int, NoneType]', id='Optional[int]'),  # noqa: UP045
+        pytest.param(int | None, 'Union[int, NoneType]', id='int | None'),
+        (Union[None, int, str], 'Union[NoneType, int, str]'),  # noqa: UP007
+        (Union[int, str, bytes], 'Union[int, str, bytes]'),  # noqa: UP007
+        (list[int], 'list[int]'),
+        (tuple[int, str, bytes], 'tuple[int, str, bytes]'),
+        (Union[list[int], set[bytes]], 'Union[list[int], set[bytes]]'),  # noqa: UP007
+        (list[tuple[int, int]], 'list[tuple[int, int]]'),
+        (dict[int, str], 'dict[int, str]'),
+        (frozenset[int], 'frozenset[int]'),
+        (tuple[int, ...], 'tuple[int, ...]'),
+        (Optional[list[int]], 'Union[list[int], NoneType]'),  # noqa: UP045
         (dict, 'dict'),
-        pytest.param(
-            DisplayGen[bool, str],
-            'DisplayGen[bool, str]',
-            marks=pytest.mark.skipif(sys.version_info[:2] <= (3, 9), reason='difference in __name__ between versions'),
-        ),
-        pytest.param(
-            DisplayGen[bool, str],
-            'tests.test_edge_cases.DisplayGen[bool, str]',
-            marks=pytest.mark.skipif(sys.version_info[:2] > (3, 9), reason='difference in __name__ between versions'),
-        ),
     ],
 )
 def test_field_type_display(type_, expected):
@@ -1633,7 +1749,7 @@ def test_type_var_bound():
 
 def test_dict_bare():
     class MyModel(BaseModel):
-        foo: Dict
+        foo: dict
 
     m = MyModel(foo={'x': 'a', 'y': None})
     assert m.foo == {'x': 'a', 'y': None}
@@ -1641,7 +1757,7 @@ def test_dict_bare():
 
 def test_list_bare():
     class MyModel(BaseModel):
-        foo: List
+        foo: list
 
     m = MyModel(foo=[1, 2, None])
     assert m.foo == [1, 2, None]
@@ -1649,7 +1765,7 @@ def test_list_bare():
 
 def test_dict_any():
     class MyModel(BaseModel):
-        foo: Dict[str, Any]
+        foo: dict[str, Any]
 
     m = MyModel(foo={'x': 'a', 'y': None})
     assert m.foo == {'x': 'a', 'y': None}
@@ -1657,7 +1773,7 @@ def test_dict_any():
 
 def test_modify_fields():
     class Foo(BaseModel):
-        foo: List[List[int]]
+        foo: list[list[int]]
 
         @field_validator('foo')
         @classmethod
@@ -1667,15 +1783,15 @@ def test_modify_fields():
     class Bar(Foo):
         pass
 
-    assert repr(Foo.model_fields['foo']) == 'FieldInfo(annotation=List[List[int]], required=True)'
-    assert repr(Bar.model_fields['foo']) == 'FieldInfo(annotation=List[List[int]], required=True)'
+    assert repr(Foo.model_fields['foo']) == 'FieldInfo(annotation=list[list[int]], required=True)'
+    assert repr(Bar.model_fields['foo']) == 'FieldInfo(annotation=list[list[int]], required=True)'
     assert Foo(foo=[[0, 1]]).foo == [[0, 1]]
     assert Bar(foo=[[0, 1]]).foo == [[0, 1]]
 
 
 def test_exclude_none():
     class MyModel(BaseModel):
-        a: Optional[int] = None
+        a: int | None = None
         b: int = 2
 
     m = MyModel(a=5)
@@ -1688,14 +1804,14 @@ def test_exclude_none():
 
 def test_exclude_none_recursive():
     class ModelA(BaseModel):
-        a: Optional[int] = None
+        a: int | None = None
         b: int = 1
 
     class ModelB(BaseModel):
         c: int
         d: int = 2
         e: ModelA
-        f: Optional[str] = None
+        f: str | None = None
 
     m = ModelB(c=5, e={'a': 0})
     assert m.model_dump() == {'c': 5, 'd': 2, 'e': {'a': 0, 'b': 1}, 'f': None}
@@ -1712,7 +1828,7 @@ def test_exclude_none_with_extra():
     class MyModel(BaseModel):
         model_config = ConfigDict(extra='allow')
         a: str = 'default'
-        b: Optional[str] = None
+        b: str | None = None
 
     m = MyModel(a='a', c='c')
 
@@ -1763,7 +1879,7 @@ def test_optional_validator():
     val_calls = []
 
     class Model(BaseModel):
-        something: Optional[str]
+        something: str | None
 
         @field_validator('something')
         @classmethod
@@ -1784,8 +1900,8 @@ def test_optional_validator():
 
 def test_required_optional():
     class Model(BaseModel):
-        nullable1: Optional[int] = ...
-        nullable2: Optional[int] = Field(...)
+        nullable1: int | None = ...
+        nullable2: int | None = Field(...)
 
     with pytest.raises(ValidationError) as exc_info:
         Model()
@@ -1811,21 +1927,39 @@ def test_required_optional():
         {
             'input': 'some text',
             'loc': ('nullable1',),
-            'msg': 'Input should be a valid integer, unable to parse string as an ' 'integer',
+            'msg': 'Input should be a valid integer, unable to parse string as an integer',
             'type': 'int_parsing',
         },
         {'input': {'nullable1': 'some text'}, 'loc': ('nullable2',), 'msg': 'Field required', 'type': 'missing'},
     ]
 
 
+def test_ellipsis_forward_ref_annotated() -> None:
+    """This previously resulted in the ellipsis being used as a default value."""
+
+    class Model(BaseModel):
+        f: 'Forward'
+
+    Forward = Annotated[int, Field(...)]
+
+    assert Model.model_fields['f'].default is PydanticUndefined
+
+
+def test_private_attr_ellipsis() -> None:
+    class Model(BaseModel):
+        _a: int = PrivateAttr(...)
+
+    assert not hasattr(Model(), '_a')
+
+
 def test_required_any():
     class Model(BaseModel):
         optional1: Any
         optional2: Any = None
-        optional3: Optional[Any] = None
+        optional3: Any | None = None
         nullable1: Any = ...
         nullable2: Any = Field(...)
-        nullable3: Optional[Any]
+        nullable3: Any | None
 
     with pytest.raises(ValidationError) as exc_info:
         Model()
@@ -2000,7 +2134,7 @@ def test_custom_generic_arbitrary_allowed():
             'ctx': {'class': 'test_custom_generic_arbitrary_allowed.<locals>.MyGen'},
             'input': 'invalid',
             'loc': ('gen',),
-            'msg': 'Input should be an instance of ' 'test_custom_generic_arbitrary_allowed.<locals>.MyGen',
+            'msg': 'Input should be an instance of test_custom_generic_arbitrary_allowed.<locals>.MyGen',
             'type': 'is_instance_of',
         }
     ]
@@ -2030,7 +2164,7 @@ def test_custom_generic_disallowed():
         r'Unable to generate pydantic-core schema for (.*)MyGen\[str, bool\](.*). '
         r'Set `arbitrary_types_allowed=True` in the model_config to ignore this error'
     )
-    with pytest.raises(TypeError, match=match):
+    with pytest.raises(PydanticUserError, match=match):
 
         class Model(BaseModel):
             a: str
@@ -2079,17 +2213,55 @@ def test_hashable_serialization():
         m.model_dump_json()
 
 
+def test_hashable_validate_json():
+    class Model(BaseModel):
+        v: Hashable
+
+    ta = TypeAdapter(Model)
+
+    # Test a large nested dict
+    for validate in (Model.model_validate_json, ta.validate_json):
+        for testcase in (
+            '{"v": "a"}',
+            '{"v": 1}',
+            '{"v": 1.0}',
+            '{"v": true}',
+            '{"v": null}',
+        ):
+            assert hash(validate(testcase).v) == hash(validate(testcase).v)
+
+
+@pytest.mark.parametrize(
+    'non_hashable',
+    [
+        '{"v": []}',
+        '{"v": {"a": 0}}',
+    ],
+)
+def test_hashable_invalid_json(non_hashable) -> None:
+    """This is primarily included in order to document the behavior / limitations of the `Hashable` type's validation logic.
+
+    Specifically, we don't do any coercions to arrays / dicts when loading from JSON, and thus they are not considered hashable.
+    This would be different if we, for example, coerced arrays to tuples.
+    """
+
+    class Model(BaseModel):
+        v: Hashable
+
+    with pytest.raises(ValidationError):
+        Model.model_validate_json(non_hashable)
+
+
 def test_hashable_json_schema():
     class Model(BaseModel):
         v: Hashable
 
-    with pytest.raises(
-        PydanticInvalidForJsonSchema,
-        match=re.escape(
-            "Cannot generate a JsonSchema for core_schema.IsInstanceSchema (<class 'collections.abc.Hashable'>)"
-        ),
-    ):
-        Model.model_json_schema()
+    assert Model.model_json_schema() == {
+        'properties': {'v': {'title': 'V'}},
+        'required': ['v'],
+        'title': 'Model',
+        'type': 'object',
+    }
 
 
 def test_default_factory_called_once():
@@ -2111,7 +2283,7 @@ def test_default_factory_called_once():
 
     class MyBadModel(BaseModel):
         model_config = ConfigDict(validate_default=True)
-        id: List[str] = Field(default_factory=factory)
+        id: list[str] = Field(default_factory=factory)
 
     with pytest.raises(ValidationError) as exc_info:
         MyBadModel()
@@ -2123,7 +2295,7 @@ def test_default_factory_called_once():
 
 def test_default_factory_validator_child():
     class Parent(BaseModel):
-        foo: List[str] = Field(default_factory=list)
+        foo: list[str] = Field(default_factory=list)
 
         @field_validator('foo', mode='before')
         @classmethod
@@ -2171,7 +2343,7 @@ def test_iter_coverage():
 def test_frozen_config_and_field():
     class Foo(BaseModel):
         model_config = ConfigDict(frozen=False, validate_assignment=True)
-        a: str = Field(...)
+        a: str
 
     assert Foo.model_fields['a'].metadata == []
 
@@ -2181,7 +2353,7 @@ def test_frozen_config_and_field():
 
     class Bar(BaseModel):
         model_config = ConfigDict(validate_assignment=True)
-        a: str = Field(..., frozen=True)
+        a: str = Field(frozen=True)
         c: Annotated[str, Field(frozen=True)]
 
     assert Bar.model_fields['a'].frozen
@@ -2475,10 +2647,37 @@ def test_invalid_forward_ref_model():
     ]
 
 
+def test_incomplete_superclass() -> None:
+    class MyModel(BaseModel):
+        sub_model: 'SubModel'
+
+    assert not MyModel.__pydantic_fields_complete__
+    assert not MyModel.__pydantic_complete__
+
+    with pytest.raises(PydanticUndefinedAnnotation, match="name 'SubModel' is not defined"):
+        MyModel.model_rebuild()
+
+    class SubModel(MyModel):
+        pass
+
+    # SubModel is complete because it reinterprets the superclass's fields and finds 'SubModel' to match itself
+    assert SubModel.__pydantic_fields_complete__
+    assert SubModel.__pydantic_complete__
+
+    # MyModel is still incomplete until it's rebuilt
+    assert not MyModel.__pydantic_fields_complete__
+    assert not MyModel.__pydantic_complete__
+
+    MyModel.model_rebuild()
+
+    assert MyModel.__pydantic_fields_complete__
+    assert MyModel.__pydantic_complete__
+
+
 @pytest.mark.parametrize(
     ('sequence_type', 'input_data', 'expected_error_type', 'expected_error_msg', 'expected_error_ctx'),
     [
-        pytest.param(List[str], '1bc', 'list_type', 'Input should be a valid list', None, id='list[str]'),
+        pytest.param(list[str], '1bc', 'list_type', 'Input should be a valid list', None, id='list[str]'),
         pytest.param(
             Sequence[str],
             '1bc',
@@ -2526,10 +2725,11 @@ def test_multiple_enums():
         a = auto()
 
     class MyModel(TypedDict):
-        a: Optional[MyEnum]
-        b: Optional[MyEnum]
+        a: MyEnum | None
+        b: MyEnum | None
 
-    TypeAdapter(MyModel)
+    ta = TypeAdapter(MyModel)
+    assert ta.validate_json('{"a": 1, "b": 1}') == {'a': MyEnum.a, 'b': MyEnum.a}
 
 
 @pytest.mark.parametrize(
@@ -2545,22 +2745,12 @@ def test_multiple_enums():
 )
 def test_union_literal_with_other_type(literal_type, other_type, data, json_value, data_reversed, json_value_reversed):
     class Model(BaseModel):
-        value: Union[literal_type, other_type]
-        value_types_reversed: Union[other_type, literal_type]
+        value: literal_type | other_type
+        value_types_reversed: other_type | literal_type
 
     m = Model(value=data, value_types_reversed=data)
     assert m.model_dump() == {'value': data, 'value_types_reversed': data_reversed}
     assert m.model_dump_json() == f'{{"value":{json_value},"value_types_reversed":{json_value_reversed}}}'
-
-
-def test_type_union():
-    class Model(BaseModel):
-        a: Type[Union[str, bytes]]
-        b: Type[Union[Any, str]]
-
-    m = Model(a=bytes, b=int)
-    assert m.model_dump() == {'a': bytes, 'b': int}
-    assert m.a == bytes
 
 
 def test_model_repr_before_validation():
@@ -2644,7 +2834,7 @@ def test_recursive_root_models_in_discriminated_union():
 
     class Model2(BaseModel):
         kind: Literal['2'] = '2'
-        one: Optional[Model1]
+        one: Model1 | None
 
     class Root1(RootModel[Model1]):
         @property
@@ -2659,8 +2849,8 @@ def test_recursive_root_models_in_discriminated_union():
             return self.root.kind
 
     class Outer(BaseModel):
-        a: Annotated[Union[Root1, Root2], Field(discriminator='kind')]
-        b: Annotated[Union[Root1, Root2], Field(discriminator='kind')]
+        a: Annotated[Root1 | Root2, Field(discriminator='kind')]
+        b: Annotated[Root1 | Root2, Field(discriminator='kind')]
 
     validated = Outer.model_validate({'a': {'kind': '1', 'two': None}, 'b': {'kind': '2', 'one': None}})
     assert validated == Outer(a=Root1(root=Model1(two=None)), b=Root2(root=Model2(one=None)))
@@ -2670,7 +2860,7 @@ def test_recursive_root_models_in_discriminated_union():
         '$defs': {
             'Model1': {
                 'properties': {
-                    'kind': {'const': '1', 'default': '1', 'enum': ['1'], 'title': 'Kind', 'type': 'string'},
+                    'kind': {'const': '1', 'default': '1', 'title': 'Kind', 'type': 'string'},
                     'two': {'anyOf': [{'$ref': '#/$defs/Model2'}, {'type': 'null'}]},
                 },
                 'required': ['two'],
@@ -2679,15 +2869,15 @@ def test_recursive_root_models_in_discriminated_union():
             },
             'Model2': {
                 'properties': {
-                    'kind': {'const': '2', 'default': '2', 'enum': ['2'], 'title': 'Kind', 'type': 'string'},
+                    'kind': {'const': '2', 'default': '2', 'title': 'Kind', 'type': 'string'},
                     'one': {'anyOf': [{'$ref': '#/$defs/Model1'}, {'type': 'null'}]},
                 },
                 'required': ['one'],
                 'title': 'Model2',
                 'type': 'object',
             },
-            'Root1': {'allOf': [{'$ref': '#/$defs/Model1'}], 'title': 'Root1'},
-            'Root2': {'allOf': [{'$ref': '#/$defs/Model2'}], 'title': 'Root2'},
+            'Root1': {'$ref': '#/$defs/Model1', 'title': 'Root1'},
+            'Root2': {'$ref': '#/$defs/Model2', 'title': 'Root2'},
         },
         'properties': {
             'a': {
@@ -2733,3 +2923,289 @@ def test_eq_with_cached_property():
     obj1.cached
     # Ensure the objects still compare equals after caching a property
     assert obj1 == obj2
+
+
+def test_model_metaclass_on_other_class() -> None:
+    """Test that `ModelMetaclass` can be used as a metaclass on an unrelated class.
+
+    This is done by some libraries to offer compatibility between Pydantic versions.
+    """
+
+    class OtherClass(metaclass=ModelMetaclass):
+        pass
+
+
+@pytest.mark.skipif(sys.version_info < (3, 12), reason='requires Python 3.12+')
+def test_nested_type_statement():
+    # https://docs.python.org/3/reference/simple_stmts.html#type
+
+    globs = {}
+    exec(
+        """
+from pydantic import BaseModel
+class A(BaseModel):
+    type Int = int
+    a: Int
+""",
+        globs,
+    )
+    A = globs['A']
+    assert A(a=1).a == 1
+
+
+def test_method_descriptors_default() -> None:
+    class SomeModel(BaseModel):
+        @staticmethod
+        def default_int_factory() -> int: ...
+
+        int_factory: Callable[[], int] = Field(default=default_int_factory)
+
+    assert SomeModel.model_fields['int_factory'].default is SomeModel.default_int_factory
+
+
+def test_setattr_handler_memo_does_not_inherit() -> None:
+    class Model1(BaseModel):
+        a: int
+
+    class Model2(Model1):
+        a: int
+
+    m1 = Model1(a=1)
+    m2 = Model2(a=10)
+
+    assert not Model1.__pydantic_setattr_handlers__
+    assert not Model2.__pydantic_setattr_handlers__
+
+    m2.a = 11
+    assert not Model1.__pydantic_setattr_handlers__
+    assert 'a' in Model2.__pydantic_setattr_handlers__
+    handler2 = Model2.__pydantic_setattr_handlers__['a']
+
+    m1.a = 2
+    assert 'a' in Model1.__pydantic_setattr_handlers__
+    assert Model1.__pydantic_setattr_handlers__['a'] is handler2
+    assert Model2.__pydantic_setattr_handlers__['a'] is handler2
+    assert m1.a == 2 and m2.a == 11
+
+
+def test_setattr_handler_does_not_memoize_unknown_field() -> None:
+    class Model(BaseModel):
+        a: int
+
+    m = Model(a=1)
+    with pytest.raises(ValueError, match='object has no field "unknown"'):
+        m.unknown = 'x'
+    assert not Model.__pydantic_setattr_handlers__
+    m.a = 2
+    assert 'a' in Model.__pydantic_setattr_handlers__
+
+
+def test_setattr_handler_does_not_memoize_unknown_private_field() -> None:
+    class Model(BaseModel):
+        a: int
+        _p: str
+
+    m = Model(a=1)
+    assert not Model.__pydantic_setattr_handlers__
+    m.a = 2
+    assert len(Model.__pydantic_setattr_handlers__) == 1
+    m._unknown = 'x'
+    assert len(Model.__pydantic_setattr_handlers__) == 1
+    m._p = 'y'
+    assert len(Model.__pydantic_setattr_handlers__) == 2
+
+
+def test_setattr_handler_does_not_memoize_on_validate_assignment_field_failure() -> None:
+    class Model(BaseModel, validate_assignment=True):
+        a: int
+
+    m = Model(a=1)
+    with pytest.raises(ValidationError):
+        m.unknown = 'x'
+    with pytest.raises(ValidationError):
+        m.a = 'y'
+    assert not Model.__pydantic_setattr_handlers__
+    m.a = 2
+    assert 'a' in Model.__pydantic_setattr_handlers__
+
+
+# The following 3 tests define a `__get_pydantic_core_schema__()` method on Pydantic models.
+# This isn't explicitly supported and can lead to unexpected side effects, but are here
+# to prevent potential regressions:
+
+
+def test_get_pydantic_core_schema_on_referenceable_type() -> None:
+    # This ensures that even if you define the method, it won't actually
+    # be called twice and the cached definition will be used instead.
+    # Note that what is important here is that the `Test` definition does
+    # not raise a `LookupError` when calling the `handler` (see
+    # `CallbackGetCoreSchemaHandler.__call__` calling `resolve_ref_schema`).
+    counter = 0
+
+    class Model(BaseModel):
+        @classmethod
+        def __get_pydantic_core_schema__(
+            cls, source: type[BaseModel], handler: GetCoreSchemaHandler, /
+        ) -> core_schema.CoreSchema:
+            rv = handler(source)
+            nonlocal counter
+            counter += 1
+            return rv
+
+    counter = 0  # reset the counter to only account for the `Test` definition
+
+    class Test(Model):
+        t: 'Test'
+
+    assert counter == 1
+
+
+def test_repeated_custom_type() -> None:
+    class Numeric(BaseModel):
+        value: float
+
+        @classmethod
+        def __get_pydantic_core_schema__(cls, source_type: Any, handler: GetCoreSchemaHandler) -> CoreSchema:
+            return core_schema.no_info_before_validator_function(cls._validate, handler(source_type))
+
+        @classmethod
+        def _validate(cls, v: Any) -> dict[str, Any] | Self:
+            if isinstance(v, (str, float, int)):
+                return cls(value=v)
+            if isinstance(v, Numeric):
+                return v
+            if isinstance(v, dict):
+                return v
+            raise ValueError(f'Invalid value for {cls}: {v}')
+
+    def is_positive(value: Numeric):
+        assert value.value > 0.0, 'Must be positive'
+
+    class OuterModel(BaseModel):
+        x: Numeric
+        y: Numeric
+        z: Annotated[Numeric, AfterValidator(is_positive)]
+
+    assert OuterModel(x=2, y=-1, z=1)
+
+    with pytest.raises(ValidationError):
+        OuterModel(x=2, y=-1, z=-1)
+
+
+def test_get_pydantic_core_schema_noop() -> None:
+    """https://github.com/pydantic/pydantic/issues/12096"""
+
+    class Metadata(BaseModel):
+        foo: int = 100
+
+        @classmethod
+        def __get_pydantic_core_schema__(cls, source_type, handler: GetCoreSchemaHandler) -> CoreSchema:
+            return handler(source_type)
+
+    class Model1(BaseModel):
+        f: Annotated[str, Metadata()]
+
+    assert isinstance(Model1.model_fields['f'].metadata[0], Metadata)
+    assert Model1(f='test').f == 'test'
+
+    class Model2(BaseModel):
+        f1: Annotated[str, Metadata()]
+        f2: Annotated[str, Metadata()] = 'f2'
+
+    m2 = Model2(f1='f1')
+    assert m2.f1 == 'f1'
+    assert m2.f2 == 'f2'
+
+
+def test_validator_and_serializer_not_reused_during_rebuild() -> None:
+    # Make sure validators and serializers are deleted before model rebuild,
+    # so that they don't end up being reused in pydantic-core (since we look
+    # for `cls.__pydantic_validator/serializer__`).
+    # This test makes the assertion on the serialization behavior.
+    class Model(BaseModel):
+        a: int
+
+    Model.model_fields['a'].exclude = True
+    Model.model_rebuild(force=True)
+
+    m = Model(a=1)
+    assert m.model_dump() == {}
+
+
+@pytest.mark.filterwarnings('ignore:.*`__get_validators__`.*:DeprecationWarning')
+def test_get_schema_on_classes_with_both_v1_and_v2_apis() -> None:
+    class Model(BaseModel):
+        a: int
+
+        @model_validator(mode='after')
+        def my_model_validator(self):
+            return self
+
+        @classmethod
+        def __get_validators__(cls):
+            raise AssertionError('This should not be called')
+
+
+def test_model_fields_set_includes_extra_after_assignment():
+    """Regression test for https://github.com/pydantic/pydantic/issues/11134.
+
+    Extra fields set after initialization should be included in model_fields_set.
+    """
+    from pydantic import BaseModel, ConfigDict
+
+    class Model(BaseModel):
+        model_config = ConfigDict(extra='allow')
+        field: int
+
+    m = Model.model_validate({'field': 1, 'extra_at_init': 2})
+    assert m.model_fields_set == {'field', 'extra_at_init'}
+
+    m.extra_after_init = 3
+    assert m.model_fields_set == {'field', 'extra_at_init', 'extra_after_init'}
+    assert m.model_extra == {'extra_at_init': 2, 'extra_after_init': 3}
+
+
+def test_safe_get_annotations_from_dict() -> None:
+    """https://github.com/pydantic/pydantic/issues/13520"""
+
+    class Meta(type):
+        pass
+
+    Meta.__annotations__
+
+    class Base(metaclass=Meta):
+        pass
+
+    class Main(Base):
+        f: int
+
+    class Sub(Main):
+        pass
+
+    assert safe_get_annotations(Sub) == {}
+
+
+@pytest.mark.timeout(10)
+def test_interconnected_models_build_in_linear_time() -> None:
+    classes: list[type[BaseModel]] = []
+    for i in range(60):
+        fields: dict[str, Any] = {'value': (int, ...)}
+        for j, prev in enumerate(classes[-3:]):
+            fields[f'ref{j}'] = (prev | None, None)
+        classes.append(create_model(f'Node{i}', **fields))
+
+    last = classes[-1]
+    instance = last.model_validate({'value': 1, 'ref2': {'value': 2, 'ref2': {'value': 3}}})
+    assert instance.ref2.ref2.value == 3
+    assert instance.model_dump(exclude_none=True) == {'value': 1, 'ref2': {'value': 2, 'ref2': {'value': 3}}}
+
+
+def test_unhasbable_generic_alias() -> None:
+    """https://github.com/pydantic/pydantic/issues/13645"""
+
+    class Meta:
+        __hash__ = None
+
+    ta = TypeAdapter(list[Annotated[int, Meta()]])
+
+    assert ta.validate_python(['1']) == [1]

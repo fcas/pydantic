@@ -9,9 +9,10 @@ Pydantic models are simply classes which inherit from `BaseModel` and define fie
         members:
           - __init__
           - model_config
-          - model_computed_fields
-          - model_extra
           - model_fields
+          - model_computed_fields
+          - __pydantic_core_schema__
+          - model_extra
           - model_fields_set
           - model_construct
           - model_copy
@@ -23,7 +24,7 @@ Pydantic models are simply classes which inherit from `BaseModel` and define fie
           - model_rebuild
           - model_validate
           - model_validate_json
-          - copy
+          - model_validate_strings
 
 ::: pydantic.create_model
     options:

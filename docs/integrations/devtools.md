@@ -10,10 +10,8 @@ Pydantic integrates with *devtools* by implementing the `__pretty__` method on m
 
 In particular `debug()` is useful when inspecting models:
 
-
-```py test="no-print-intercept"
+```python {test="no-print-intercept"}
 from datetime import datetime
-from typing import List
 
 from devtools import debug
 
@@ -31,7 +29,7 @@ class User(BaseModel):
     id: int
     name: str
     signup_ts: datetime
-    friends: List[int]
+    friends: list[int]
     address: Address
 
 
@@ -50,3 +48,7 @@ print('user:', user)
 Will output in your terminal:
 
 {{ devtools_example }}
+
+`debug()` is a development-time tool: it prints to the terminal of a process you're watching. The
+closest equivalent for a deployed application is [Logfire](logfire.md), where models and validations
+show up as structured output you can browse and query.

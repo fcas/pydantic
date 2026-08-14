@@ -2,12 +2,13 @@
 
 from __future__ import annotations as _annotations
 
+from collections.abc import Callable
 from functools import partial, partialmethod
 from types import FunctionType
-from typing import TYPE_CHECKING, Any, Callable, TypeVar, Union, overload
+from typing import TYPE_CHECKING, Any, Literal, TypeAlias, TypeVar, Union, overload
 from warnings import warn
 
-from typing_extensions import Literal, Protocol, TypeAlias, deprecated
+from typing_extensions import Protocol, deprecated
 
 from .._internal import _decorators, _decorators_v1
 from ..errors import PydanticUserError
@@ -19,30 +20,24 @@ _ALLOW_REUSE_WARNING_MESSAGE = '`allow_reuse` is deprecated and will be ignored;
 if TYPE_CHECKING:
 
     class _OnlyValueValidatorClsMethod(Protocol):
-        def __call__(self, __cls: Any, __value: Any) -> Any:
-            ...
+        def __call__(self, __cls: Any, __value: Any) -> Any: ...
 
     class _V1ValidatorWithValuesClsMethod(Protocol):
-        def __call__(self, __cls: Any, __value: Any, values: dict[str, Any]) -> Any:
-            ...
+        def __call__(self, __cls: Any, __value: Any, values: dict[str, Any]) -> Any: ...
 
     class _V1ValidatorWithValuesKwOnlyClsMethod(Protocol):
-        def __call__(self, __cls: Any, __value: Any, *, values: dict[str, Any]) -> Any:
-            ...
+        def __call__(self, __cls: Any, __value: Any, *, values: dict[str, Any]) -> Any: ...
 
     class _V1ValidatorWithKwargsClsMethod(Protocol):
-        def __call__(self, __cls: Any, **kwargs: Any) -> Any:
-            ...
+        def __call__(self, __cls: Any, **kwargs: Any) -> Any: ...
 
     class _V1ValidatorWithValuesAndKwargsClsMethod(Protocol):
-        def __call__(self, __cls: Any, values: dict[str, Any], **kwargs: Any) -> Any:
-            ...
+        def __call__(self, __cls: Any, values: dict[str, Any], **kwargs: Any) -> Any: ...
 
     class _V1RootValidatorClsMethod(Protocol):
         def __call__(
             self, __cls: Any, __values: _decorators_v1.RootValidatorValues
-        ) -> _decorators_v1.RootValidatorValues:
-            ...
+        ) -> _decorators_v1.RootValidatorValues: ...
 
     V1Validator = Union[
         _OnlyValueValidatorClsMethod,
@@ -61,7 +56,7 @@ if TYPE_CHECKING:
         _decorators_v1.V1RootValidatorFunction,
     ]
 
-    _PartialClsOrStaticMethod: TypeAlias = Union[classmethod[Any, Any, Any], staticmethod[Any, Any], partialmethod[Any]]
+    _PartialClsOrStaticMethod: TypeAlias = classmethod[Any, Any, Any] | staticmethod[Any, Any] | partialmethod[Any]
 
     # Allow both a V1 (assumed pre=False) or V2 (assumed mode='after') validator
     # We lie to type checkers and say we return the same thing we get
@@ -124,19 +119,19 @@ def validator(
     )
 
     if allow_reuse is True:  # pragma: no cover
-        warn(_ALLOW_REUSE_WARNING_MESSAGE, DeprecationWarning)
-    fields = tuple((__field, *fields))
+        warn(_ALLOW_REUSE_WARNING_MESSAGE, DeprecationWarning, stacklevel=2)
+    fields = __field, *fields
     if isinstance(fields[0], FunctionType):
         raise PydanticUserError(
             '`@validator` should be used with fields and keyword arguments, not bare. '
             "E.g. usage should be `@validator('<field_name>', ...)`",
-            code='validator-no-fields',
+            code='decorator-missing-arguments',
         )
     elif not all(isinstance(field, str) for field in fields):
         raise PydanticUserError(
             '`@validator` fields should be passed as separate string args. '
             "E.g. usage should be `@validator('<field_name_1>', '<field_name_2>', ...)`",
-            code='validator-invalid-fields',
+            code='decorator-invalid-fields',
         )
 
     mode: Literal['before', 'after'] = 'before' if pre is True else 'after'
@@ -171,8 +166,7 @@ def root_validator(
 ) -> Callable[
     [_V1RootValidatorFunctionType],
     _V1RootValidatorFunctionType,
-]:
-    ...
+]: ...
 
 
 @overload
@@ -185,8 +179,7 @@ def root_validator(
 ) -> Callable[
     [_V1RootValidatorFunctionType],
     _V1RootValidatorFunctionType,
-]:
-    ...
+]: ...
 
 
 @overload
@@ -200,8 +193,7 @@ def root_validator(
 ) -> Callable[
     [_V1RootValidatorFunctionType],
     _V1RootValidatorFunctionType,
-]:
-    ...
+]: ...
 
 
 @deprecated(
@@ -243,7 +235,7 @@ def root_validator(
         return root_validator()(*__args)  # type: ignore
 
     if allow_reuse is True:  # pragma: no cover
-        warn(_ALLOW_REUSE_WARNING_MESSAGE, DeprecationWarning)
+        warn(_ALLOW_REUSE_WARNING_MESSAGE, DeprecationWarning, stacklevel=2)
     mode: Literal['before', 'after'] = 'before' if pre is True else 'after'
     if pre is False and skip_on_failure is not True:
         raise PydanticUserError(

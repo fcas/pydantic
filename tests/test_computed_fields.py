@@ -1,7 +1,9 @@
 import random
 import sys
 from abc import ABC, abstractmethod
-from typing import Any, Callable, ClassVar, Generic, List, Tuple, TypeVar
+from collections.abc import Callable
+from functools import cached_property, lru_cache, singledispatchmethod
+from typing import Annotated, Any, ClassVar, Generic, TypeVar
 
 import pytest
 from pydantic_core import ValidationError, core_schema
@@ -10,6 +12,7 @@ from typing_extensions import TypedDict
 from pydantic import (
     BaseModel,
     Field,
+    FieldSerializationInfo,
     GetCoreSchemaHandler,
     PrivateAttr,
     TypeAdapter,
@@ -20,13 +23,6 @@ from pydantic import (
 )
 from pydantic.alias_generators import to_camel
 from pydantic.errors import PydanticUserError
-
-try:
-    from functools import cached_property, lru_cache, singledispatchmethod
-except ImportError:
-    cached_property = None
-    lru_cache = None
-    singledispatchmethod = None
 
 
 def test_computed_fields_get():
@@ -49,13 +45,13 @@ def test_computed_fields_get():
             return self.width * 2
 
     rect = Rectangle(width=10, length=5)
-    assert set(rect.model_fields) == {'width', 'length'}
-    assert set(rect.model_computed_fields) == {'area', 'area2'}
+    assert set(Rectangle.model_fields) == {'width', 'length'}
+    assert set(Rectangle.model_computed_fields) == {'area', 'area2'}
     assert rect.__dict__ == {'width': 10, 'length': 5}
 
-    assert rect.model_computed_fields['area'].description == 'An awesome area'
-    assert rect.model_computed_fields['area2'].title == 'Pikarea'
-    assert rect.model_computed_fields['area2'].description == 'Another area'
+    assert Rectangle.model_computed_fields['area'].description == 'An awesome area'
+    assert Rectangle.model_computed_fields['area2'].title == 'Pikarea'
+    assert Rectangle.model_computed_fields['area2'].description == 'Another area'
 
     assert rect.area == 50
     assert rect.double_width == 20
@@ -151,6 +147,7 @@ def test_computed_fields_set():
     assert s.model_dump() == {'side': 10.0, 'area': 100.0, 'area_string': '100.0 SQUARE UNITS'}
     s.area = 64
     assert s.model_dump() == {'side': 8.0, 'area': 64.0, 'area_string': '64.0 SQUARE UNITS'}
+    assert Square.model_computed_fields['area'].wrapped_property is Square.area
 
 
 def test_computed_fields_del():
@@ -179,7 +176,6 @@ def test_computed_fields_del():
     assert user.model_dump() == {'first': '', 'last': '', 'fullname': ' '}
 
 
-@pytest.mark.skipif(cached_property is None, reason='cached_property not available')
 def test_cached_property():
     class Model(BaseModel):
         minimum: int = Field(alias='min')
@@ -209,6 +205,13 @@ def test_cached_property():
     assert rect.model_dump() == {'minimum': 10, 'maximum': 10_000, 'random_number': first_n}
     assert rect.model_dump(by_alias=True) == {'min': 10, 'max': 10_000, 'the magic number': first_n}
     assert rect.model_dump(by_alias=True, exclude={'random_number'}) == {'min': 10, 'max': 10000}
+
+    # `cached_property` is a non-data descriptor, assert that you can assign a value to it:
+    rect2 = Model(min=1, max=1)
+    rect2.cached_property_2 = 1
+    rect2._cached_property_3 = 2
+    assert rect2.cached_property_2 == 1
+    assert rect2._cached_property_3 == 2
 
 
 def test_properties_and_computed_fields():
@@ -255,7 +258,6 @@ def test_computed_fields_repr():
     assert repr(Model(x=2)) == 'Model(x=2, triple=6)'
 
 
-@pytest.mark.skipif(singledispatchmethod is None, reason='singledispatchmethod not available')
 def test_functools():
     class Model(BaseModel, frozen=True):
         x: int
@@ -289,11 +291,11 @@ def test_include_exclude():
         y: int
 
         @computed_field
-        def x_list(self) -> List[int]:
+        def x_list(self) -> list[int]:
             return [self.x, self.x + 1]
 
         @computed_field
-        def y_list(self) -> List[int]:
+        def y_list(self) -> list[int]:
             return [self.y, self.y + 1, self.y + 2]
 
     m = Model(x=1, y=2)
@@ -329,7 +331,7 @@ def test_expected_type():
         y: int
 
         @computed_field
-        def x_list(self) -> List[int]:
+        def x_list(self) -> list[int]:
             return [self.x, self.x + 1]
 
         @computed_field
@@ -348,15 +350,24 @@ def test_expected_type_wrong():
         x: int
 
         @computed_field
-        def x_list(self) -> List[int]:
+        def x_list(self) -> list[int]:
             return 'not a list'
 
     m = Model(x=1)
-    with pytest.warns(UserWarning, match=r'Expected `list\[int\]` but got `str`'):
+    with pytest.warns(
+        UserWarning,
+        match=r"Expected `list\[int\]` - serialized value may not be as expected \[field_name='x_list', input_value='not a list', input_type=str\]",
+    ):
         m.model_dump()
-    with pytest.warns(UserWarning, match=r'Expected `list\[int\]` but got `str`'):
+    with pytest.warns(
+        UserWarning,
+        match=r"Expected `list\[int\]` - serialized value may not be as expected \[field_name='x_list', input_value='not a list', input_type=str\]",
+    ):
         m.model_dump(mode='json')
-    with pytest.warns(UserWarning, match=r'Expected `list\[int\]` but got `str`'):
+    with pytest.warns(
+        UserWarning,
+        match=r"Expected `list\[int\]` - serialized value may not be as expected \[field_name='x_list', input_value='not a list', input_type=str\]",
+    ):
         m.model_dump_json()
 
 
@@ -405,7 +416,7 @@ def test_free_function():
         double = computed_field(double_func)
 
     m = MyModel(x=2)
-    assert set(m.model_fields) == {'x'}
+    assert set(MyModel.model_fields) == {'x'}
     assert m.__private_attributes__ == {}
     assert m.double == 4
     assert repr(m) == 'MyModel(x=2, double=4)'
@@ -427,7 +438,10 @@ def test_private_computed_field():
     assert m.model_dump() == {'x': 2, '_double': 4}
 
 
-@pytest.mark.skipif(sys.version_info < (3, 9), reason='@computed_field @classmethod @property only works in 3.9+')
+@pytest.mark.skipif(
+    sys.version_info >= (3, 13),
+    reason='@computed_field @classmethod @property only works in 3.9-3.12',
+)
 def test_classmethod():
     class MyModel(BaseModel):
         x: int
@@ -529,7 +543,7 @@ def test_abstractmethod():
         (BaseModel,),
     ],
 )
-def test_abstractmethod_missing(bases: Tuple[Any, ...]):
+def test_abstractmethod_missing(bases: tuple[Any, ...]):
     class AbstractSquare(*bases):
         side: float
 
@@ -608,7 +622,7 @@ def test_alias_generator():
             return self.my_standard_field + 4
 
     class MySubModel(MyModel):
-        model_config = dict(alias_generator=to_camel, populate_by_name=True)
+        model_config = dict(alias_generator=to_camel, validate_by_name=True)
 
     model = MyModel(my_standard_field=1)
     assert model.model_dump() == {
@@ -641,6 +655,18 @@ def test_alias_generator():
         'myAliasedComputedField1': 4,
         'my_alias_2': 5,
     }
+
+
+def test_alias_generator_defer_build() -> None:
+    class Model(BaseModel):
+        model_config = {'alias_generator': to_camel, 'defer_build': True}
+
+        @computed_field
+        @property
+        def my_prop(self) -> int:
+            return 1
+
+    assert Model.__pydantic_decorators__.computed_fields['my_prop'].info.alias == 'myProp'
 
 
 def make_base_model() -> Any:
@@ -727,8 +753,8 @@ def test_multiple_references_to_schema(model_factory: Callable[[], Any]) -> None
     assert ta.json_schema(mode='serialization') == {
         '$defs': {'CompModel': {'properties': {}, 'title': 'CompModel', 'type': 'object'}},
         'properties': {
-            'comp_1': {'allOf': [{'$ref': '#/$defs/CompModel'}], 'readOnly': True},
-            'comp_2': {'allOf': [{'$ref': '#/$defs/CompModel'}], 'readOnly': True},
+            'comp_1': {'$ref': '#/$defs/CompModel', 'readOnly': True},
+            'comp_2': {'$ref': '#/$defs/CompModel', 'readOnly': True},
         },
         'required': ['comp_1', 'comp_2'],
         'title': 'Model',
@@ -750,9 +776,9 @@ def test_generic_computed_field():
     assert A[int](x=1).model_dump() == {'x': 1, 'double_x': 2}
     assert A[str](x='abc').model_dump() == {'x': 'abc', 'double_x': 'abcabc'}
 
-    assert A(x='xxxxxx').model_computed_fields['double_x'].return_type == T
-    assert A[int](x=123).model_computed_fields['double_x'].return_type == int
-    assert A[str](x='x').model_computed_fields['double_x'].return_type == str
+    assert A.model_computed_fields['double_x'].return_type is T
+    assert A[int].model_computed_fields['double_x'].return_type is int
+    assert A[str].model_computed_fields['double_x'].return_type is str
 
     class B(BaseModel, Generic[T]):
         @computed_field
@@ -760,7 +786,10 @@ def test_generic_computed_field():
         def double_x(self) -> T:
             return 'abc'  # this may not match the annotated return type, and will warn if not
 
-    with pytest.warns(UserWarning, match='Expected `int` but got `str` - serialized value may not be as expected'):
+    with pytest.warns(
+        UserWarning,
+        match=r"Expected `int` - serialized value may not be as expected \[field_name='double_x', input_value='abc', input_type=str\]",
+    ):
         B[int]().model_dump()
 
 
@@ -768,7 +797,9 @@ def test_computed_field_override_raises():
     class Model(BaseModel):
         name: str = 'foo'
 
-    with pytest.raises(ValueError, match="you can't override a field with a computed field"):
+    with pytest.raises(
+        TypeError, match="Field 'name' of class 'SubModel' overrides symbol of same name in a parent class"
+    ):
 
         class SubModel(Model):
             @computed_field
@@ -792,3 +823,73 @@ def test_computed_field_excluded_from_model_dump_recursive() -> None:
 
     m = Model(bar=42)
     assert m.model_dump() == {'bar': 42, 'id': 'id: {"bar":42}'}
+
+
+def test_computed_field_with_field_serializer():
+    class MyModel(BaseModel):
+        other_field: int = 42
+
+        @computed_field
+        @property
+        def my_field(self) -> str:
+            return 'foo'
+
+        @field_serializer('*')
+        def my_field_serializer(self, value: Any, info: FieldSerializationInfo) -> Any:
+            return f'{info.field_name} = {value}'
+
+    assert MyModel().model_dump() == {'my_field': 'my_field = foo', 'other_field': 'other_field = 42'}
+
+
+def test_computed_fields_exclude() -> None:
+    class Model(BaseModel):
+        @computed_field
+        def prop(self) -> int:
+            return 1
+
+    m = Model()
+    assert m.model_dump() == {'prop': 1}
+    assert m.model_dump(exclude_computed_fields=True) == {}
+    assert m.model_dump(mode='json') == {'prop': 1}
+    assert m.model_dump(mode='json', exclude_computed_fields=True) == {}
+    assert m.model_dump_json() == '{"prop":1}'
+    assert m.model_dump_json(exclude_computed_fields=True) == '{}'
+
+
+def test_computed_fields_serialization_exclude_if() -> None:
+    class Model(BaseModel):
+        foo: int
+
+        @computed_field(exclude_if=lambda x: x == 1)
+        def bar(self) -> int:
+            return 1
+
+        @computed_field(exclude_if=lambda x: x == 2)
+        def baz(self) -> int:
+            return self.foo
+
+    m = Model(foo=1)
+    assert m.model_dump() == {'foo': 1, 'baz': 1}
+    assert m.model_dump(exclude_computed_fields=True) == {'foo': 1}
+    assert m.model_dump(mode='json') == {'foo': 1, 'baz': 1}
+    assert m.model_dump(mode='json', exclude_computed_fields=True) == {'foo': 1}
+    assert m.model_dump_json() == '{"foo":1,"baz":1}'
+    assert m.model_dump_json(exclude_computed_fields=True) == '{"foo":1}'
+
+
+@pytest.mark.xfail(reason='Not supported yet. See: https://github.com/pydantic/pydantic/pull/12748')
+def test_computed_fields_serialization_exclude_if_from_annotated() -> None:
+    class Model(BaseModel):
+        foo: int
+
+        @computed_field
+        def prop(self) -> Annotated[int, Field(exclude_if=lambda x: x == 1)]:
+            return 1
+
+    m = Model(foo=1)
+    assert m.model_dump() == {'foo': 1}
+    assert m.model_dump(exclude_computed_fields=True) == {'foo': 1}
+    assert m.model_dump(mode='json') == {'foo': 1}
+    assert m.model_dump(mode='json', exclude_computed_fields=True) == {'foo': 1}
+    assert m.model_dump_json() == '{"foo":1}'
+    assert m.model_dump_json(exclude_computed_fields=True) == '{"foo":1}'

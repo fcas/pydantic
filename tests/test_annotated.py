@@ -1,91 +1,113 @@
-import sys
-from typing import Any, Generic, Iterator, List, Set, TypeVar
+import datetime as dt
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass
+from decimal import Decimal
+from typing import Annotated, Any, Generic, TypeVar
 
 import pytest
-from annotated_types import BaseMetadata, GroupedMetadata, Gt, Lt, Predicate
-from pydantic_core import PydanticUndefined, core_schema
-from typing_extensions import Annotated
+import pytz
+from annotated_types import BaseMetadata, GroupedMetadata, Gt, Lt, Not, Predicate
+from pydantic_core import CoreSchema, PydanticUndefined, core_schema
+from typing_extensions import Sentinel
 
-from pydantic import BaseModel, Field, GetCoreSchemaHandler, TypeAdapter, ValidationError
+from pydantic import (
+    BaseModel,
+    BeforeValidator,
+    Field,
+    GetCoreSchemaHandler,
+    PydanticUserError,
+    TypeAdapter,
+    ValidationError,
+)
 from pydantic.errors import PydanticSchemaGenerationError
 from pydantic.fields import PrivateAttr
 from pydantic.functional_validators import AfterValidator
 
-NO_VALUE = object()
+NO_DEFAULT = Sentinel('NO_DEFAULT')
 
 
 @pytest.mark.parametrize(
-    'hint_fn,value,expected_repr',
+    'type_expr,value,expected_repr',
     [
-        (
-            lambda: Annotated[int, Gt(0)],
+        pytest.param(
+            Annotated[int, Gt(0)],
             5,
             'FieldInfo(annotation=int, required=False, default=5, metadata=[Gt(gt=0)])',
+            id='Annotated[int, Gt(0)]-5',
         ),
-        (
-            lambda: Annotated[int, Field(gt=0)],
+        pytest.param(
+            Annotated[int, Field(gt=0)],
             5,
             'FieldInfo(annotation=int, required=False, default=5, metadata=[Gt(gt=0)])',
+            id='Annotated[int, Field(gt=0)]-5',
         ),
-        (
-            lambda: int,
+        pytest.param(
+            int,
             Field(5, gt=0),
             'FieldInfo(annotation=int, required=False, default=5, metadata=[Gt(gt=0)])',
+            id='int-Field(5, gt=0)',
         ),
-        (
-            lambda: int,
+        pytest.param(
+            int,
             Field(default_factory=lambda: 5, gt=0),
             'FieldInfo(annotation=int, required=False, default_factory=<lambda>, metadata=[Gt(gt=0)])',
+            id='int-Field(default_factory=lambda: 5, gt=0)',
         ),
-        (
-            lambda: Annotated[int, Lt(2)],
+        pytest.param(
+            Annotated[int, Lt(2)],
             Field(5, gt=0),
             'FieldInfo(annotation=int, required=False, default=5, metadata=[Gt(gt=0), Lt(lt=2)])',
+            id='Annotated[int, Lt(2)]-Field(5, gt=0)',
         ),
-        (
-            lambda: Annotated[int, Gt(0)],
-            NO_VALUE,
+        pytest.param(
+            Annotated[int, Gt(0)],
+            NO_DEFAULT,
             'FieldInfo(annotation=int, required=True, metadata=[Gt(gt=0)])',
+            id='Annotated[int, Gt(0)]-NO_VALUE',
         ),
-        (
-            lambda: Annotated[int, Gt(0)],
+        pytest.param(
+            Annotated[int, Gt(0)],
             Field(),
             'FieldInfo(annotation=int, required=True, metadata=[Gt(gt=0)])',
+            id='Annotated[int, Gt(0)]-Field()',
         ),
-        (
-            lambda: int,
+        pytest.param(
+            int,
             Field(gt=0),
             'FieldInfo(annotation=int, required=True, metadata=[Gt(gt=0)])',
+            id='int-Field(gt=0)',
         ),
-        (
-            lambda: Annotated[int, Gt(0)],
+        pytest.param(
+            Annotated[int, Gt(0)],
             PydanticUndefined,
             'FieldInfo(annotation=int, required=True, metadata=[Gt(gt=0)])',
+            id='Annotated[int, Gt(0)]-PydanticUndefined',
         ),
-        (
-            lambda: Annotated[int, Field(gt=0), Lt(2)],
+        pytest.param(
+            Annotated[int, Field(gt=0), Lt(2)],
             5,
             'FieldInfo(annotation=int, required=False, default=5, metadata=[Gt(gt=0), Lt(lt=2)])',
+            id='Annotated[int, Field(gt=0), Lt(2)]-5',
         ),
-        (
-            lambda: Annotated[int, Field(alias='foobar')],
+        pytest.param(
+            Annotated[int, Field(alias='foobar')],
             PydanticUndefined,
             "FieldInfo(annotation=int, required=True, alias='foobar', alias_priority=2)",
+            id="Annotated[int, Field(alias='foobar')]-PydanticUndefined",
         ),
     ],
 )
-def test_annotated(hint_fn, value, expected_repr):
-    hint = hint_fn()
+def test_annotated(type_expr, value, expected_repr):
 
-    if value is NO_VALUE:
+    if value is NO_DEFAULT:
 
         class M(BaseModel):
-            x: hint
+            x: type_expr
 
     else:
 
         class M(BaseModel):
-            x: hint = value
+            x: type_expr = value
 
     assert repr(M.model_fields['x']) == expected_repr
 
@@ -101,26 +123,27 @@ def test_annotated_allows_unknown(metadata):
     assert metadata in M.__annotations__['x'].__metadata__, 'Annotated type is recorded'
 
 
+@pytest.mark.thread_unsafe(reason='`pytest.raises()` is thread unsafe')
 @pytest.mark.parametrize(
-    ['hint_fn', 'value', 'empty_init_ctx'],
+    ['type_expr', 'value', 'empty_init_ctx'],
     [
-        (
-            lambda: int,
+        pytest.param(
+            int,
             PydanticUndefined,
             pytest.raises(ValueError, match=r'Field required \[type=missing,'),
+            id='int-PydanticUndefined',
         ),
-        (
-            lambda: Annotated[int, Field()],
+        pytest.param(
+            Annotated[int, Field()],
             PydanticUndefined,
             pytest.raises(ValueError, match=r'Field required \[type=missing,'),
+            id='Annotated[int, Field()]-PydanticUndefined',
         ),
     ],
 )
-def test_annotated_instance_exceptions(hint_fn, value, empty_init_ctx):
-    hint = hint_fn()
-
+def test_annotated_instance_exceptions(type_expr, value, empty_init_ctx):
     class M(BaseModel):
-        x: hint = value
+        x: type_expr = value
 
     with empty_init_ctx:
         assert M().x == 5
@@ -149,14 +172,13 @@ def test_config_field_info():
     }
 
 
-@pytest.mark.skipif(sys.version_info < (3, 10), reason='repr different on older versions')
 def test_annotated_alias() -> None:
     # https://github.com/pydantic/pydantic/issues/2971
 
     StrAlias = Annotated[str, Field(max_length=3)]
     IntAlias = Annotated[int, Field(default_factory=lambda: 2)]
 
-    Nested = Annotated[List[StrAlias], Field(description='foo')]
+    Nested = Annotated[list[StrAlias], Field(description='foo')]
 
     class MyModel(BaseModel):
         a: StrAlias = 'abc'
@@ -171,13 +193,13 @@ def test_annotated_alias() -> None:
         'b': 'FieldInfo(annotation=str, required=True, metadata=[MaxLen(max_length=3)])',
         'c': 'FieldInfo(annotation=int, required=False, default_factory=<lambda>)',
         'd': 'FieldInfo(annotation=int, required=False, default_factory=<lambda>)',
-        'e': "FieldInfo(annotation=List[Annotated[str, FieldInfo(annotation=NoneType, required=True, metadata=[MaxLen(max_length=3)])]], required=True, description='foo')",
+        'e': "FieldInfo(annotation=list[Annotated[str, FieldInfo(annotation=NoneType, required=True, metadata=[MaxLen(max_length=3)])]], required=True, description='foo')",
     }
     assert MyModel(b='def', e=['xyz']).model_dump() == dict(a='abc', b='def', c=2, d=2, e=['xyz'])
 
 
 def test_modify_get_schema_annotated() -> None:
-    calls: List[str] = []
+    calls: list[str] = []
 
     class CustomType:
         @classmethod
@@ -233,7 +255,7 @@ def test_modify_get_schema_annotated() -> None:
 
 
 def test_get_pydantic_core_schema_source_type() -> None:
-    types: Set[Any] = set()
+    types: set[Any] = set()
 
     class PydanticMarker:
         def __get_pydantic_core_schema__(self, source: Any, handler: GetCoreSchemaHandler) -> core_schema.CoreSchema:
@@ -362,6 +384,12 @@ def test_validate_float_inf_nan_python() -> None:
     ]
 
 
+def test_predicate_success_python() -> None:
+    ta = TypeAdapter(Annotated[int, Predicate(lambda x: x > 0)])
+
+    assert ta.validate_python(1) == 1
+
+
 def test_predicate_error_python() -> None:
     ta = TypeAdapter(Annotated[int, Predicate(lambda x: x > 0)])
 
@@ -373,8 +401,25 @@ def test_predicate_error_python() -> None:
         {
             'type': 'predicate_failed',
             'loc': (),
-            'msg': 'Predicate test_predicate_error_python.<locals>.<lambda> failed',
+            'msg': "Predicate 'test_predicate_error_python.<locals>.<lambda>' failed",
             'input': -1,
+        }
+    ]
+
+
+def test_not_operation_error_python() -> None:
+    ta = TypeAdapter(Annotated[int, Not(lambda x: x > 5)])
+
+    with pytest.raises(ValidationError) as exc_info:
+        ta.validate_python(6)
+
+    # insert_assert(exc_info.value.errors(include_url=False))
+    assert exc_info.value.errors(include_url=False) == [
+        {
+            'type': 'not_operation_failed',
+            'loc': (),
+            'msg': "Not of 'test_not_operation_error_python.<locals>.<lambda>' failed",
+            'input': 6,
         }
     ]
 
@@ -409,18 +454,20 @@ def test_annotated_private_field_with_default():
     class AnnotatedPrivateFieldModel(BaseModel):
         _foo: Annotated[int, PrivateAttr(default=1)]
         _bar: Annotated[str, 'hello']
+        _baz: 'Annotated[str, PrivateAttr(default=2)]'
 
     model = AnnotatedPrivateFieldModel()
     assert model._foo == 1
+    assert model._baz == 2
 
-    assert model.__pydantic_private__ == {'_foo': 1}
+    assert model.__pydantic_private__ == {'_foo': 1, '_baz': 2}
 
     with pytest.raises(AttributeError):
         assert model._bar
 
     model._bar = 'world'
     assert model._bar == 'world'
-    assert model.__pydantic_private__ == {'_foo': 1, '_bar': 'world'}
+    assert model.__pydantic_private__ == {'_foo': 1, '_bar': 'world', '_baz': 2}
 
     with pytest.raises(AttributeError):
         assert model.bar
@@ -449,24 +496,145 @@ def test_min_length_field_info_not_lost():
         }
     ]
 
-    # Ensure that the inner annotation does not override the outer, even for metadata:
-    class AnnotatedFieldModel2(BaseModel):
-        foo: 'Annotated[String, Field(min_length=3)]' = Field(description='hello', min_length=2)
 
-    AnnotatedFieldModel2(foo='00')
+def test_tzinfo_validator_example_pattern() -> None:
+    """Test that tzinfo custom validator pattern works as explained in the examples/validators docs."""
 
-    class AnnotatedFieldModel4(BaseModel):
-        foo: 'Annotated[String, Field(min_length=3)]' = Field(description='hello', min_length=4)
+    @dataclass(frozen=True)
+    class MyDatetimeValidator:
+        tz_constraint: str | None = None
 
-    with pytest.raises(ValidationError) as exc_info:
-        AnnotatedFieldModel4(foo='00')
+        def tz_constraint_validator(
+            self,
+            value: dt.datetime,
+            handler: Callable,  # (1)!
+        ):
+            """Validate tz_constraint and tz_info."""
+            # handle naive datetimes
+            if self.tz_constraint is None:
+                assert value.tzinfo is None, 'tz_constraint is None, but provided value is tz-aware.'
+                return handler(value)
 
-    assert exc_info.value.errors(include_url=False) == [
-        {
-            'loc': ('foo',),
-            'input': '00',
-            'ctx': {'min_length': 4},
-            'msg': 'String should have at least 4 characters',
-            'type': 'string_too_short',
-        }
-    ]
+            # validate tz_constraint and tz-aware tzinfo
+            if self.tz_constraint not in pytz.all_timezones:
+                raise PydanticUserError(
+                    f'Invalid tz_constraint: {self.tz_constraint}', code='unevaluable-type-annotation'
+                )
+            result = handler(value)  # (2)!
+            assert self.tz_constraint == str(result.tzinfo), (
+                f'Invalid tzinfo: {str(result.tzinfo)}, expected: {self.tz_constraint}'
+            )
+
+            return result
+
+        def __get_pydantic_core_schema__(
+            self,
+            source_type: Any,
+            handler: GetCoreSchemaHandler,
+        ) -> CoreSchema:
+            return core_schema.no_info_wrap_validator_function(
+                self.tz_constraint_validator,
+                handler(source_type),
+            )
+
+    LA = 'America/Los_Angeles'
+
+    # passing naive test
+    ta = TypeAdapter(Annotated[dt.datetime, MyDatetimeValidator()])
+    ta.validate_python(dt.datetime.now())
+
+    # failing naive test
+    ta = TypeAdapter(Annotated[dt.datetime, MyDatetimeValidator()])
+    with pytest.raises(Exception):
+        ta.validate_python(dt.datetime.now(pytz.timezone(LA)))
+
+    # passing tz-aware test
+    ta = TypeAdapter(Annotated[dt.datetime, MyDatetimeValidator(LA)])
+    ta.validate_python(dt.datetime.now(pytz.timezone(LA)))
+
+    # failing bad tz
+    ta = TypeAdapter(Annotated[dt.datetime, MyDatetimeValidator('foo')])
+    with pytest.raises(Exception):
+        ta.validate_python(dt.datetime.now())
+
+    # failing tz-aware test
+    ta = TypeAdapter(Annotated[dt.datetime, MyDatetimeValidator(LA)])
+    with pytest.raises(Exception):
+        ta.validate_python(dt.datetime.now())
+
+
+def test_utcoffset_validator_example_pattern() -> None:
+    """Test that utcoffset custom validator pattern works as explained in the examples/validators docs."""
+
+    @dataclass(frozen=True)
+    class MyDatetimeValidator:
+        lower_bound: int
+        upper_bound: int
+
+        def validate_tz_bounds(self, value: dt.datetime, handler: Callable):
+            """Validate and test bounds"""
+            assert value.utcoffset() is not None, 'UTC offset must exist'
+            assert self.lower_bound <= self.upper_bound, 'Invalid bounds'
+
+            result = handler(value)
+
+            hours_offset = value.utcoffset().total_seconds() / 3600
+            assert self.lower_bound <= hours_offset <= self.upper_bound, 'Value out of bounds'
+
+            return result
+
+        def __get_pydantic_core_schema__(
+            self,
+            source_type: Any,
+            handler: GetCoreSchemaHandler,
+        ) -> CoreSchema:
+            return core_schema.no_info_wrap_validator_function(
+                self.validate_tz_bounds,
+                handler(source_type),
+            )
+
+    LA = 'America/Los_Angeles'
+
+    # test valid bound passing
+    ta = TypeAdapter(Annotated[dt.datetime, MyDatetimeValidator(-10, 10)])
+    ta.validate_python(dt.datetime.now(pytz.timezone(LA)))
+
+    # test valid bound failing - missing TZ
+    ta = TypeAdapter(Annotated[dt.datetime, MyDatetimeValidator(-12, 12)])
+    with pytest.raises(Exception):
+        ta.validate_python(dt.datetime.now())
+
+    # test invalid bound
+    ta = TypeAdapter(Annotated[dt.datetime, MyDatetimeValidator(0, 4)])
+    with pytest.raises(Exception):
+        ta.validate_python(dt.datetime.now(pytz.timezone(LA)))
+
+
+def test_incompatible_metadata_error() -> None:
+    ta = TypeAdapter(Annotated[list[int], Field(pattern='abc')])
+    with pytest.raises(TypeError, match="Unable to apply constraint 'pattern'"):
+        ta.validate_python([1, 2, 3])
+
+
+def test_compatible_metadata_raises_correct_validation_error() -> None:
+    """Using a no-op before validator to ensure that constraint is applied as part of a chain."""
+    ta = TypeAdapter(Annotated[str, BeforeValidator(lambda x: x), Field(pattern='abc')])
+    with pytest.raises(ValidationError, match="String should match pattern 'abc'"):
+        ta.validate_python('def')
+
+
+def test_decimal_constraints_after_annotation() -> None:
+    DecimalAnnotation = Annotated[Decimal, BeforeValidator(lambda v: v), Field(max_digits=10, decimal_places=4)]
+
+    ta = TypeAdapter(DecimalAnnotation)
+    assert ta.validate_python(Decimal('123.4567')) == Decimal('123.4567')
+
+    with pytest.raises(ValidationError) as e:
+        ta.validate_python(Decimal('123.45678'))
+
+    assert e.value.errors()[0]['type'] == 'decimal_max_places'
+
+    with pytest.raises(ValidationError) as e:
+        ta.validate_python(Decimal('12345678.901'))
+
+    assert e.value.errors()[0]['type'] == 'decimal_max_digits'

@@ -1,4 +1,4 @@
-# Pydantic
+# Pydantic Validation
 
 [![CI](https://img.shields.io/github/actions/workflow/status/pydantic/pydantic/ci.yml?branch=main&logo=github&label=CI)](https://github.com/pydantic/pydantic/actions?query=event%3Apush+branch%3Amain+workflow%3ACI)
 [![Coverage](https://coverage-badge.samuelcolvin.workers.dev/pydantic/pydantic.svg)](https://coverage-badge.samuelcolvin.workers.dev/redirect/pydantic/pydantic)
@@ -7,48 +7,49 @@
 [![downloads](https://static.pepy.tech/badge/pydantic/month)](https://pepy.tech/project/pydantic)
 [![versions](https://img.shields.io/pypi/pyversions/pydantic.svg)](https://github.com/pydantic/pydantic)
 [![license](https://img.shields.io/github/license/pydantic/pydantic.svg)](https://github.com/pydantic/pydantic/blob/main/LICENSE)
-[![Pydantic v2](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/pydantic/pydantic/main/docs/badge/v2.json)](https://docs.pydantic.dev/latest/contributing/#badges)
+[![Pydantic v2](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/pydantic/pydantic/main/docs/badge/v2.json)](https://pydantic.dev/docs/validation/latest/get-started/contributing/#badges)
+[![llms.txt](https://img.shields.io/badge/llms.txt-green)](https://pydantic.dev/docs/validation/latest/llms.txt)
 
 Data validation using Python type hints.
 
 Fast and extensible, Pydantic plays nicely with your linters/IDE/brain.
-Define how data should be in pure, canonical Python 3.8+; validate it with Pydantic.
+Define how data should be in pure, canonical Python 3.10+; validate it with Pydantic.
 
-## Pydantic Company :rocket:
+## Pydantic Logfire :fire:
 
-We've started a company based on the principles that I believe have led to Pydantic's success.
-Learn more from the [Company Announcement](https://blog.pydantic.dev/blog/2023/02/16/company-announcement--pydantic/).
+We've launched Pydantic Logfire to help you monitor your applications.
+[Learn more](https://pydantic.dev/logfire/?utm_source=pydantic_validation)
 
 ## Pydantic V1.10 vs. V2
 
 Pydantic V2 is a ground-up rewrite that offers many new features, performance improvements, and some breaking changes compared to Pydantic V1.
 
 If you're using Pydantic V1 you may want to look at the
-[pydantic V1.10 Documentation](https://docs.pydantic.dev/) or,
+[pydantic V1.10 Documentation](https://pydantic.dev/docs/validation/latest/get-started/) or,
 [`1.10.X-fixes` git branch](https://github.com/pydantic/pydantic/tree/1.10.X-fixes). Pydantic V2 also ships with the latest version of Pydantic V1 built in so that you can incrementally upgrade your code base and projects: `from pydantic import v1 as pydantic_v1`.
 
 ## Help
 
-See [documentation](https://docs.pydantic.dev/) for more details.
+See [documentation](https://pydantic.dev/docs/validation/latest/get-started/) for more details.
 
 ## Installation
 
 Install using `pip install -U pydantic` or `conda install pydantic -c conda-forge`.
 For more installation options to make Pydantic even faster,
-see the [Install](https://docs.pydantic.dev/install/) section in the documentation.
+see the [Install](https://pydantic.dev/docs/validation/latest/get-started/install/) section in the documentation.
 
 ## A Simple Example
 
-```py
+```python
 from datetime import datetime
-from typing import List, Optional
+from typing import Optional
 from pydantic import BaseModel
 
 class User(BaseModel):
     id: int
     name: str = 'John Doe'
     signup_ts: Optional[datetime] = None
-    friends: List[int] = []
+    friends: list[int] = []
 
 external_data = {'id': '123', 'signup_ts': '2017-06-01 12:22', 'friends': [1, '2', b'3']}
 user = User(**external_data)
@@ -62,7 +63,7 @@ print(user.id)
 
 For guidance on setting up a development environment and how to make a
 contribution to Pydantic, see
-[Contributing to Pydantic](https://docs.pydantic.dev/contributing/).
+[Contributing to Pydantic](https://pydantic.dev/docs/validation/latest/get-started/contributing/).
 
 ## Reporting a Security Vulnerability
 

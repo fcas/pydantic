@@ -1,32 +1,33 @@
 import dataclasses
+import re
+import sys
 import typing
-from typing import List, Optional, Union
 
 import pytest
 import typing_extensions
-from typing_extensions import NamedTuple, TypedDict
+from typing_extensions import NamedTuple, TypedDict, TypeForm
 
-from pydantic import BaseModel, Field, TypeAdapter, ValidationError
+from pydantic import BaseModel, Field, PydanticUserError, TypeAdapter, ValidationError, computed_field, validate_call
 
+self_types: list[TypeForm] = []
+ids: list[str] = []
+if sys.version_info >= (3, 11):
+    self_types.append(typing.Self)
+    ids.append('typing-self')
+    if typing.Self is not typing_extensions.Self:
+        self_types.append(typing_extensions.Self)
+        ids.append('typing-extensions-self')
+else:
+    self_types.append(typing_extensions.Self)
+    ids.append('typing-extensions-self')
 
-@pytest.fixture(
-    name='Self',
-    params=[
-        pytest.param(typing, id='typing.Self'),
-        pytest.param(typing_extensions, id='t_e.Self'),
-    ],
-)
-def fixture_self_all(request):
-    try:
-        return request.param.Self
-    except AttributeError:
-        pytest.skip(f'Self is not available from {request.param}')
+pytestmark = pytest.mark.parametrize('Self', self_types, ids=ids)
 
 
 def test_recursive_model(Self):
     class SelfRef(BaseModel):
         data: int
-        ref: typing.Optional[Self] = None
+        ref: Self | None = None
 
     assert SelfRef(data=1, ref={'data': 2}).model_dump() == {'data': 1, 'ref': {'data': 2, 'ref': None}}
 
@@ -34,7 +35,7 @@ def test_recursive_model(Self):
 def test_recursive_model_invalid(Self):
     class SelfRef(BaseModel):
         data: int
-        ref: typing.Optional[Self] = None
+        ref: Self | None = None
 
     with pytest.raises(
         ValidationError,
@@ -90,7 +91,7 @@ def test_recursive_model_with_subclass_override(Self):
 
     class SubSelfRef(SelfRef):
         y: int
-        ref: Optional[Union[SelfRef, Self]] = None
+        ref: SelfRef | Self | None = None
 
     assert SubSelfRef(x=1, ref=SubSelfRef(x=3, y=4), y=2).model_dump() == {
         'x': 1,
@@ -105,17 +106,18 @@ def test_recursive_model_with_subclass_override(Self):
 
 
 def test_self_type_with_field(Self):
-    with pytest.raises(TypeError, match=r'The following constraints cannot be applied.*\'gt\''):
+    class SelfRef(BaseModel):
+        x: int
+        refs: list[Self] = Field(gt=0)
 
-        class SelfRef(BaseModel):
-            x: int
-            refs: typing.List[Self] = Field(..., gt=0)
+    with pytest.raises(TypeError, match=re.escape("Unable to apply constraint 'gt' to supplied value []")):
+        SelfRef(x=1, refs=[SelfRef(x=2, refs=[])])
 
 
 def test_self_type_json_schema(Self):
     class SelfRef(BaseModel):
         x: int
-        refs: Optional[List[Self]] = []
+        refs: list[Self] | None = []
 
     assert SelfRef.model_json_schema() == {
         '$defs': {
@@ -133,7 +135,7 @@ def test_self_type_json_schema(Self):
                 'type': 'object',
             }
         },
-        'allOf': [{'$ref': '#/$defs/SelfRef'}],
+        '$ref': '#/$defs/SelfRef',
     }
 
 
@@ -169,3 +171,70 @@ def test_self_type_in_dataclass(Self):
     assert m.item.ref.x == 2
     with pytest.raises(dataclasses.FrozenInstanceError):
         m.item.ref.x = 3
+
+
+def test_invalid_validate_call(Self):
+    with pytest.raises(PydanticUserError, match='`typing.Self` is invalid in this context'):
+
+        @validate_call
+        def foo(self: Self):
+            pass
+
+
+def test_invalid_validate_call_of_method(Self):
+    with pytest.raises(PydanticUserError, match='`typing.Self` is invalid in this context'):
+
+        class A(BaseModel):
+            @validate_call
+            def foo(self: Self):
+                pass
+
+
+def test_type_of_self(Self):
+    class A(BaseModel):
+        self_type: type[Self]
+
+        @computed_field
+        def self_types1(self) -> list[type[Self]]:
+            return [type(self), self.self_type]
+
+        # make sure forward refs are supported:
+        @computed_field
+        def self_types2(self) -> list[type['Self']]:
+            return [type(self), self.self_type]
+
+        @computed_field
+        def self_types3(self) -> 'list[type[Self]]':
+            return [type(self), self.self_type]
+
+        @computed_field
+        def self_types4(self) -> 'list[type[Self]]':
+            return [type(self), self.self_type]
+
+        @computed_field
+        def self_types5(self) -> list['type[Self]']:
+            return [type(self), self.self_type]
+
+    class B(A): ...
+
+    A(self_type=A)
+    A(self_type=B)
+    B(self_type=B)
+
+    a = A(self_type=B)
+    for prop in (a.self_types1, a.self_types2, a.self_types3):
+        assert prop == [A, B]
+
+    for invalid_type in (type, int, A, object):
+        with pytest.raises(ValidationError) as exc_info:
+            B(self_type=invalid_type)
+
+        assert exc_info.value.errors(include_url=False) == [
+            {
+                'type': 'is_subclass_of',
+                'loc': ('self_type',),
+                'msg': f'Input should be a subclass of {B.__qualname__}',
+                'input': invalid_type,
+                'ctx': {'class': B.__qualname__},
+            }
+        ]

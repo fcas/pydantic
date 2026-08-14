@@ -1,5 +1,6 @@
+from collections.abc import Callable
 from datetime import datetime
-from typing import Any, Callable, List, TypeVar, Union
+from typing import Any, TypeVar, Union
 
 from faker import Faker
 
@@ -20,7 +21,7 @@ def one_of(*callables: Callable[[], Any]) -> Any:
     return f.random.choice(callables)()
 
 
-def list_of(callable: Callable[[], T], max_length: int) -> List[T]:
+def list_of(callable: Callable[[], T], max_length: int) -> list[T]:
     return [callable() for _ in range(f.random_int(max=max_length))]
 
 
@@ -123,5 +124,5 @@ def person() -> dict:
     }
 
 
-def person_data(length: int) -> List[dict]:
+def person_data(length: int) -> list[dict]:
     return [person() for _ in range(length)]

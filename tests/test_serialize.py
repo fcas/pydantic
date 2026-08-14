@@ -1,16 +1,19 @@
 """
 New tests for v2 of serialization logic.
 """
+
 import json
 import re
 import sys
+from collections.abc import Callable
 from enum import Enum
 from functools import partial, partialmethod
-from typing import Any, Callable, ClassVar, Dict, List, Optional, Pattern, Union
+from re import Pattern
+from typing import Annotated, Any, ClassVar, Optional
 
 import pytest
 from pydantic_core import PydanticSerializationError, core_schema, to_jsonable_python
-from typing_extensions import Annotated, TypedDict
+from typing_extensions import TypedDict
 
 from pydantic import (
     BaseModel,
@@ -139,17 +142,64 @@ def test_serializer_annotated_typing_cache(serializer, func):
     FancyInt = Annotated[int, serializer(func)]
 
     class FancyIntModel(BaseModel):
-        x: Optional[FancyInt]
+        x: FancyInt | None
 
     assert FancyIntModel(x=1234).model_dump() == {'x': '1,235'}
 
 
+def test_use_bare_field_serializer():
+    with pytest.raises(PydanticUserError, check=lambda e: e.code == 'decorator-missing-arguments'):
+
+        class Model(BaseModel):
+            a: str
+
+            @field_serializer
+            def checker(cls, v):
+                return v
+
+
+def test_use_no_fields_field_serializer():
+    with pytest.raises(
+        TypeError, match=re.escape("field_serializer() missing 1 required positional argument: 'field'")
+    ):
+
+        class Model(BaseModel):
+            a: str
+
+            @field_serializer()
+            def checker(cls, v):
+                return v
+
+
+def test_field_serializer_bad_fields_throws_configerror():
+    with pytest.raises(PydanticUserError, check=lambda e: e.code == 'decorator-invalid-fields'):
+
+        class Model1(BaseModel):
+            a: str
+            b: str
+
+            @field_serializer(['a', 'b'])
+            def check_fields(cls, v):
+                return v
+
+    with pytest.raises(PydanticUserError, check=lambda e: e.code == 'decorator-invalid-fields'):
+
+        class Model2(BaseModel):
+            a: str
+            b: str
+
+            @field_serializer(['a', 'b'])
+            @classmethod
+            def check_fields(cls, v):
+                return v
+
+
 def test_serialize_decorator_always():
     class MyModel(BaseModel):
-        x: Optional[int]
+        x: int | None
 
         @field_serializer('x')
-        def customise_x_serialization(v, _info) -> str:
+        def customise_x_serialization(v, _info: SerializationInfo) -> str:
             return f'{v:,}'
 
     assert MyModel(x=1234).model_dump() == {'x': '1,234'}
@@ -182,7 +232,7 @@ def test_serialize_decorator_json():
 
 def test_serialize_decorator_unless_none():
     class MyModel(BaseModel):
-        x: Optional[int]
+        x: int | None
 
         @field_serializer('x', when_used='unless-none')
         def customise_x_serialization(v):
@@ -225,6 +275,10 @@ def test_serialize_valid_signatures():
     def ser_plain(v: Any, info: SerializationInfo) -> Any:
         return f'{v:,}'
 
+    def ser_plain_no_info(v: Any, unrelated_arg: int = 1, other_unrelated_arg: int = 2) -> Any:
+        # Arguments with default values are not treated as info arg.
+        return f'{v:,}'
+
     def ser_wrap(v: Any, nxt: SerializerFunctionWrapHandler, info: SerializationInfo) -> Any:
         return f'{nxt(v):,}'
 
@@ -233,6 +287,7 @@ def test_serialize_valid_signatures():
         f2: int
         f3: int
         f4: int
+        f5: int
 
         @field_serializer('f1')
         def ser_f1(self, v: Any, info: FieldSerializationInfo) -> Any:
@@ -249,7 +304,8 @@ def test_serialize_valid_signatures():
             return f'{nxt(v):,}'
 
         ser_f3 = field_serializer('f3')(ser_plain)
-        ser_f4 = field_serializer('f4', mode='wrap')(ser_wrap)
+        ser_f4 = field_serializer('f4')(ser_plain_no_info)
+        ser_f5 = field_serializer('f5', mode='wrap')(ser_wrap)
 
     m = MyModel(**{f'f{x}': x * 1_000 for x in range(1, 9)})
 
@@ -258,48 +314,46 @@ def test_serialize_valid_signatures():
         'f2': '2,000',
         'f3': '3,000',
         'f4': '4,000',
+        'f5': '5,000',
     }
-    assert m.model_dump_json() == '{"f1":"1,000","f2":"2,000","f3":"3,000","f4":"4,000"}'
+    assert m.model_dump_json() == '{"f1":"1,000","f2":"2,000","f3":"3,000","f4":"4,000","f5":"5,000"}'
 
 
 def test_invalid_signature_no_params() -> None:
-    with pytest.raises(TypeError, match='Unrecognized field_serializer function signature'):
+    with pytest.raises(PydanticUserError, match='Unrecognized field_serializer function signature'):
 
         class _(BaseModel):
             x: int
 
             # caught by type checkers
             @field_serializer('x')
-            def no_args() -> Any:
-                ...
+            def no_args() -> Any: ...
 
 
 def test_invalid_signature_single_params() -> None:
-    with pytest.raises(TypeError, match='Unrecognized field_serializer function signature'):
+    with pytest.raises(PydanticUserError, match='Unrecognized field_serializer function signature'):
 
         class _(BaseModel):
             x: int
 
             # not caught by type checkers
             @field_serializer('x')
-            def no_args(self) -> Any:
-                ...
+            def no_args(self) -> Any: ...
 
 
 def test_invalid_signature_too_many_params_1() -> None:
-    with pytest.raises(TypeError, match='Unrecognized field_serializer function signature'):
+    with pytest.raises(PydanticUserError, match='Unrecognized field_serializer function signature'):
 
         class _(BaseModel):
             x: int
 
             # caught by type checkers
             @field_serializer('x')
-            def no_args(self, value: Any, nxt: Any, info: Any, extra_param: Any) -> Any:
-                ...
+            def no_args(self, value: Any, nxt: Any, info: Any, extra_param: Any) -> Any: ...
 
 
 def test_invalid_signature_too_many_params_2() -> None:
-    with pytest.raises(TypeError, match='Unrecognized field_serializer function signature'):
+    with pytest.raises(PydanticUserError, match='Unrecognized field_serializer function signature'):
 
         class _(BaseModel):
             x: int
@@ -307,20 +361,18 @@ def test_invalid_signature_too_many_params_2() -> None:
             # caught by type checkers
             @field_serializer('x')
             @staticmethod
-            def no_args(not_self: Any, value: Any, nxt: Any, info: Any) -> Any:
-                ...
+            def no_args(not_self: Any, value: Any, nxt: Any, info: Any) -> Any: ...
 
 
 def test_invalid_signature_bad_plain_signature() -> None:
-    with pytest.raises(TypeError, match='Unrecognized field_serializer function signature for'):
+    with pytest.raises(PydanticUserError, match='Unrecognized field_serializer function signature for'):
 
         class _(BaseModel):
             x: int
 
             # caught by type checkers
             @field_serializer('x', mode='plain')
-            def no_args(self, value: Any, nxt: Any, info: Any) -> Any:
-                ...
+            def no_args(self, value: Any, nxt: Any, info: Any) -> Any: ...
 
 
 def test_serialize_ignore_info_plain():
@@ -347,10 +399,10 @@ def test_serialize_ignore_info_wrap():
 
 def test_serialize_decorator_self_info():
     class MyModel(BaseModel):
-        x: Optional[int]
+        x: int | None
 
         @field_serializer('x')
-        def customise_x_serialization(self, v, info) -> str:
+        def customise_x_serialization(self, v, info: SerializationInfo) -> str:
             return f'{info.mode}:{v:,}'
 
     assert MyModel(x=1234).model_dump() == {'x': 'python:1,234'}
@@ -359,7 +411,7 @@ def test_serialize_decorator_self_info():
 
 def test_serialize_decorator_self_no_info():
     class MyModel(BaseModel):
-        x: Optional[int]
+        x: int | None
 
         @field_serializer('x')
         def customise_x_serialization(self, v) -> str:
@@ -401,7 +453,7 @@ def test_model_serializer_plain_info():
         b: bytes
 
         @model_serializer
-        def _serialize(self, info):
+        def _serialize(self, info: SerializationInfo):
             if info.exclude:
                 return {k: v for k, v in self.__dict__.items() if k not in info.exclude}
             else:
@@ -446,7 +498,7 @@ def test_model_serializer_wrap_info():
         c: bytes = Field(exclude=True)
 
         @model_serializer(mode='wrap')
-        def _serialize(self, handler, info):
+        def _serialize(self, handler, info: SerializationInfo):
             d = handler(self)
             d['info'] = f'mode={info.mode} exclude={info.exclude}'
             return d
@@ -479,10 +531,16 @@ def test_model_serializer_plain_json_return_type():
 
     m = MyModel(a=666)
     assert m.model_dump() == {'a': 666}
-    with pytest.warns(UserWarning, match='Expected `str` but got `int` - serialized value may not be as expected'):
+    with pytest.warns(
+        UserWarning,
+        match=r'Expected `str` - serialized value may not be as expected \[input_value=666, input_type=int\]',
+    ):
         assert m.model_dump(mode='json') == 666
 
-    with pytest.warns(UserWarning, match='Expected `str` but got `int` - serialized value may not be as expected'):
+    with pytest.warns(
+        UserWarning,
+        match=r'Expected `str` - serialized value may not be as expected \[input_value=666, input_type=int\]',
+    ):
         assert m.model_dump_json() == '666'
 
 
@@ -491,7 +549,7 @@ def test_model_serializer_wrong_args():
         r'Unrecognized model_serializer function signature for '
         r'<.+MyModel._serialize at 0x\w+> with `mode=plain`:\(self, x, y, z\)'
     )
-    with pytest.raises(TypeError, match=m):
+    with pytest.raises(PydanticUserError, match=m):
 
         class MyModel(BaseModel):
             a: int
@@ -502,7 +560,7 @@ def test_model_serializer_wrong_args():
 
 
 def test_model_serializer_no_self():
-    with pytest.raises(TypeError, match='`@model_serializer` must be applied to instance methods'):
+    with pytest.raises(PydanticUserError, match='`@model_serializer` must be applied to instance methods'):
 
         class MyModel(BaseModel):
             a: int
@@ -513,7 +571,7 @@ def test_model_serializer_no_self():
 
 
 def test_model_serializer_classmethod():
-    with pytest.raises(TypeError, match='`@model_serializer` must be applied to instance methods'):
+    with pytest.raises(PydanticUserError, match='`@model_serializer` must be applied to instance methods'):
 
         class MyModel(BaseModel):
             a: int
@@ -526,7 +584,7 @@ def test_model_serializer_classmethod():
 
 def test_field_multiple_serializer():
     m = "Multiple field serializer functions were defined for field 'x', this is not allowed."
-    with pytest.raises(TypeError, match=m):
+    with pytest.raises(PydanticUserError, match=m):
 
         class MyModel(BaseModel):
             x: int
@@ -678,8 +736,8 @@ def test_serializer_allow_reuse_inheritance_override():
     # defining an _different_ serializer on the other hand is not allowed
     # because they would both "exist" thus causing confusion
     # since it's not clear if both or just one will run
-    msg = 'Multiple field serializer functions were defined ' "for field 'x', this is not allowed."
-    with pytest.raises(TypeError, match=msg):
+    msg = "Multiple field serializer functions were defined for field 'x', this is not allowed."
+    with pytest.raises(PydanticUserError, match=msg):
 
         class _(Parent):
             @field_serializer('x')
@@ -687,7 +745,7 @@ def test_serializer_allow_reuse_inheritance_override():
                 return 'err'
 
     # the same thing applies if defined on the same class
-    with pytest.raises(TypeError, match=msg):
+    with pytest.raises(PydanticUserError, match=msg):
 
         class _(BaseModel):
             x: int
@@ -769,7 +827,7 @@ def test_serializer_allow_reuse_different_field_3():
             y: int
 
             ser_x = field_serializer('x')(ser1)
-            ser_x = field_serializer('y')(ser2)
+            ser_x = field_serializer('y')(ser2)  # noqa: PIE794
 
     assert Model(x=1, y=2).model_dump() == {'x': 1, 'y': 'ser2'}
 
@@ -826,7 +884,7 @@ def test_serialize_with_extra():
         a: str = 'a'
 
     class Outer(BaseModel):
-        # this cause the inner model incorrectly dumpped:
+        # this cause the inner model incorrectly dumped:
         model_config = ConfigDict(extra='allow')
         inner: Inner = Field(default_factory=Inner)
 
@@ -841,7 +899,7 @@ def test_model_serializer_nested_models() -> None:
         inner: Optional['Model']
 
         @model_serializer(mode='wrap')
-        def ser_model(self, handler: Callable[['Model'], Dict[str, Any]]) -> Dict[str, Any]:
+        def ser_model(self, handler: Callable[['Model'], dict[str, Any]]) -> dict[str, Any]:
             inner = handler(self)
             inner['x'] += 1
             return inner
@@ -886,18 +944,50 @@ def test_clear_return_schema():
     assert return_serializer == 'return_serializer: Any'
 
 
+def test_serializer_return_type_model() -> None:
+    """https://github.com/pydantic/pydantic/issues/10443"""
+
+    class Sub(BaseModel):
+        pass
+
+    class Model(BaseModel):
+        sub: Annotated[
+            Sub,
+            PlainSerializer(lambda v: v, return_type=Sub),
+        ]
+
+    assert Model(sub=Sub()).model_dump() == {'sub': {}}
+
+
 def test_type_adapter_dump_json():
     class Model(TypedDict):
         x: int
         y: float
 
         @model_serializer(mode='plain')
-        def ser_model(self) -> Dict[str, Any]:
+        def ser_model(self) -> dict[str, Any]:
             return {'x': self['x'] * 2, 'y': self['y'] * 3}
 
     ta = TypeAdapter(Model)
 
     assert ta.dump_json(Model({'x': 1, 'y': 2.5})) == b'{"x":2,"y":7.5}'
+
+
+def test_type_adapter_dump_with_context():
+    class Model(TypedDict):
+        x: int
+        y: float
+
+        @model_serializer(mode='wrap')
+        def _serialize(self, handler, info: SerializationInfo):
+            data = handler(self)
+            if info.context and info.context.get('mode') == 'x-only':
+                data.pop('y')
+            return data
+
+    ta = TypeAdapter(Model)
+
+    assert ta.dump_json(Model({'x': 1, 'y': 2.5}), context={'mode': 'x-only'}) == b'{"x":1}'
 
 
 @pytest.mark.parametrize('as_annotation', [True, False])
@@ -944,7 +1034,7 @@ def test_forward_ref_for_serializers(as_annotation, mode):
                 'type': 'object',
             }
         },
-        'properties': {'x': {'allOf': [{'$ref': '#/$defs/OtherModel'}], 'title': 'X'}},
+        'properties': {'x': {'$ref': '#/$defs/OtherModel', 'title': 'X'}},
         'required': ['x'],
         'title': 'Model',
         'type': 'object',
@@ -1049,25 +1139,10 @@ def test_annotated_computed_field_custom_serializer():
     }
 
 
-def test_computed_field_custom_serializer_bad_signature():
-    error_msg = 'field_serializer on computed_field does not use info signature'
-
-    with pytest.raises(PydanticUserError, match=error_msg):
-
-        class Model(BaseModel):
-            x: int
-
-            @computed_field
-            @property
-            def two_x(self) -> int:
-                return self.x * 2
-
-            @field_serializer('two_x')
-            def ser_two_x_bad_signature(self, v, _info):
-                return f'The double of x is {v}'
-
-
-@pytest.mark.skipif(sys.version_info < (3, 9), reason='@computed_field @classmethod @property only works in 3.9+')
+@pytest.mark.skipif(
+    sys.version_info >= (3, 13),
+    reason='@computed_field @classmethod @property only works in 3.9-3.12',
+)
 def test_forward_ref_for_classmethod_computed_fields():
     class Model(BaseModel):
         y: ClassVar[int] = 4
@@ -1099,7 +1174,7 @@ def test_enum_as_dict_key() -> None:
         B = 'b'
 
     class MyModel(BaseModel):
-        foo: Dict[MyEnum, str]
+        foo: dict[MyEnum, str]
         bar: MyEnum
 
     assert MyModel(foo={MyEnum.A: 'hello'}, bar=MyEnum.B).model_dump_json() == '{"foo":{"a":"hello"},"bar":"b"}'
@@ -1116,10 +1191,10 @@ def test_subclass_support_unions() -> None:
         age: str
 
     class Home(BaseModel):
-        little_guys: Union[List[Pet], List[Kid]]
+        little_guys: list[Pet] | list[Kid]
 
     class Shelter(BaseModel):
-        pets: List[Pet]
+        pets: list[Pet]
 
     h1 = Home(little_guys=[Pet(name='spot'), Pet(name='buddy')])
     assert h1.model_dump() == {'little_guys': [{'name': 'spot'}, {'name': 'buddy'}]}
@@ -1140,7 +1215,7 @@ def test_subclass_support_unions_with_forward_ref() -> None:
         baz_id: int
 
     class Foo(BaseModel):
-        items: Union[List['Foo'], List[Bar]]
+        items: list['Foo'] | list[Bar]
 
     foo = Foo(items=[Baz(bar_id=1, baz_id=2), Baz(bar_id=3, baz_id=4)])
     assert foo.model_dump() == {'items': [{'bar_id': 1}, {'bar_id': 3}]}
@@ -1150,7 +1225,7 @@ def test_subclass_support_unions_with_forward_ref() -> None:
 
 
 def test_serialize_python_context() -> None:
-    contexts: List[Any] = [None, None, {'foo': 'bar'}]
+    contexts: list[Any] = [None, None, {'foo': 'bar'}]
 
     class Model(BaseModel):
         x: int
@@ -1168,7 +1243,7 @@ def test_serialize_python_context() -> None:
 
 
 def test_serialize_json_context() -> None:
-    contexts: List[Any] = [None, None, {'foo': 'bar'}]
+    contexts: list[Any] = [None, None, {'foo': 'bar'}]
 
     class Model(BaseModel):
         x: int
@@ -1194,3 +1269,171 @@ def test_plain_serializer_with_std_type() -> None:
     m = MyModel(x=1)
     assert m.model_dump() == {'x': 1.0}
     assert m.model_dump_json() == '{"x":1.0}'
+
+    assert m.model_json_schema(mode='serialization') == {
+        'properties': {'x': {'title': 'X', 'type': 'number'}},
+        'required': ['x'],
+        'title': 'MyModel',
+        'type': 'object',
+    }
+
+
+def test_plain_serializer_dunder_call() -> None:
+    class Replacer:
+        def __init__(self, from_: str, to_: str) -> None:
+            self._from = from_
+            self._to = to_
+
+        def __call__(self, s: str) -> str:
+            return s.replace(self._from, self._to)
+
+    class MyModel(BaseModel):
+        x: Annotated[str, PlainSerializer(Replacer('__', '.'))]
+
+    assert MyModel(x='a__b').model_dump() == {'x': 'a.b'}
+
+
+def test_plain_serializer_builtin_function() -> None:
+    """Relevant for Python <= 3.13, where we try to get `__annotations__` on built-in functions."""
+
+    class MyModel(BaseModel):
+        x: Annotated[int, PlainSerializer(abs)]
+
+    assert MyModel(x=-1).model_dump() == {'x': 1}
+
+
+@pytest.mark.xfail(reason='Waiting for union serialization fixes via https://github.com/pydantic/pydantic/issues/9688.')
+def smart_union_serialization() -> None:
+    """Initially reported via https://github.com/pydantic/pydantic/issues/9417, effectively a round tripping problem with type consistency."""
+
+    class FloatThenInt(BaseModel):
+        value: float | int | str = Field(union_mode='smart')
+
+    class IntThenFloat(BaseModel):
+        value: int | float | str = Field(union_mode='smart')
+
+    float_then_int = FloatThenInt(value=100)
+    assert type(json.loads(float_then_int.model_dump_json())['value']) is int
+
+    int_then_float = IntThenFloat(value=100)
+    assert type(json.loads(int_then_float.model_dump_json())['value']) is int
+
+
+def test_serialize_with_custom_ser() -> None:
+    class Item(BaseModel):
+        id: int
+
+        @model_serializer
+        def dump(self) -> dict[str, Any]:
+            return {'id': self.id}
+
+    class ItemContainer(BaseModel):
+        item_or_items: Item | list[Item]
+
+    items = [Item(id=i) for i in range(5)]
+    assert (
+        ItemContainer(item_or_items=items).model_dump_json()
+        == '{"item_or_items":[{"id":0},{"id":1},{"id":2},{"id":3},{"id":4}]}'
+    )
+
+
+def test_field_serializers_use_enum_ref() -> None:
+    """See https://github.com/pydantic/pydantic/issues/9394 for the original issue."""
+
+    class MyEnum(Enum):
+        A = 'a'
+        B = 'b'
+
+    class MyModel(BaseModel):
+        @computed_field
+        @property
+        def computed_a_or_b(self) -> MyEnum:
+            return MyEnum.B
+
+        @field_serializer('computed_a_or_b')
+        def serialize_my_enum(self, a_or_b: MyEnum) -> str:
+            return a_or_b.value
+
+    m = MyModel()
+    assert m.model_dump()['computed_a_or_b'] == 'b'
+
+
+def test_serialization_fallback() -> None:
+    class Arbitrary:
+        value = 1
+
+    def fallback(v: Any) -> Any:
+        if isinstance(v, Arbitrary):
+            return v.value
+
+    ta = TypeAdapter(Any)
+
+    assert ta.dump_python(Arbitrary(), fallback=fallback) == 1
+
+
+def test_wrap_ser_called_once() -> None:
+    """See https://github.com/pydantic/pydantic/issues/11505 for context.
+
+    This is effectively confirming that prebuilt serializers aren't used for wrap serializers.
+    """
+
+    class MyModel(BaseModel):
+        inner_value: str
+
+        @model_serializer(mode='wrap')
+        def my_wrapper_serializer(self, serializer):
+            self.inner_value = f'my_prefix:{self.inner_value}'
+            return serializer(self)
+
+    class MyParentModel(BaseModel):
+        nested: MyModel
+
+        @field_serializer('nested', mode='wrap')
+        def wrapped_field_serializer(self, field_value, serializer):
+            return serializer(field_value)
+
+    my_model = MyParentModel.model_validate({'nested': {'inner_value': 'foo'}})
+    assert my_model.model_dump() == {'nested': {'inner_value': 'my_prefix:foo'}}
+
+
+def test_serialization_info_properties() -> None:
+
+    class Model(BaseModel):
+        f: int
+
+        @field_serializer('f', mode='plain')
+        def ser_number(self, value: Any, info: SerializationInfo) -> Any:
+            return info
+
+    m = Model(f=1)
+
+    for property in (
+        'context',
+        'by_alias',
+        'exclude_unset',
+        'exclude_defaults',
+        'exclude_none',
+        'exclude_computed_fields',
+        'serialize_as_any',
+        'polymorphic_serialization',
+        'round_trip',
+    ):
+        assert getattr(m.model_dump(**{property: True})['f'], property) is True, f'{property!r} check failed'
+
+
+def test_model_serializer_index_key_type_error() -> None:
+    """https://github.com/pydantic/pydantic/issues/11862"""
+
+    class Model(BaseModel):
+        f: int
+
+        @model_serializer(mode='wrap')
+        def _serialize(self, handler: SerializerFunctionWrapHandler):
+            return handler(self, b'not_a_valid_type_for_index_key')
+
+    m = Model(f=1)
+    with pytest.raises(
+        PydanticSerializationError,
+        match="Error calling function `_serialize`: TypeError: 'index_key' is expected to be an integer or a string, got 'b'not_a_valid_type_for_index_key''",
+    ):
+        m.model_dump(include={'f'})

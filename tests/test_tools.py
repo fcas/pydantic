@@ -1,4 +1,4 @@
-from typing import Dict, List, Mapping, Union
+from collections.abc import Mapping
 
 import pytest
 
@@ -9,7 +9,7 @@ from pydantic.deprecated.tools import parse_obj_as, schema_json_of, schema_of
 pytestmark = pytest.mark.filterwarnings('ignore::DeprecationWarning')
 
 
-@pytest.mark.parametrize('obj,type_,parsed', [('1', int, 1), (['1'], List[int], [1])])
+@pytest.mark.parametrize('obj,type_,parsed', [('1', int, 1), (['1'], list[int], [1])])
 def test_parse_obj(obj, type_, parsed):
     assert parse_obj_as(type_, obj) == parsed
 
@@ -33,7 +33,7 @@ def test_parse_obj_preserves_subclasses():
 
     model_b = ModelB(a={1: 'f'}, b=2)
 
-    parsed = parse_obj_as(List[ModelA], [model_b])
+    parsed = parse_obj_as(list[ModelA], [model_b])
     assert parsed == [model_b]
 
 
@@ -44,7 +44,7 @@ def test_parse_obj_fails():
         {
             'input': 'a',
             'loc': (),
-            'msg': 'Input should be a valid integer, unable to parse string as an ' 'integer',
+            'msg': 'Input should be a valid integer, unable to parse string as an integer',
             'type': 'int_parsing',
         }
     ]
@@ -72,15 +72,15 @@ def test_parse_as_dataclass():
 
 def test_parse_mapping_as():
     inputs = {'1': '2'}
-    assert parse_obj_as(Dict[int, int], inputs) == {1: 2}
+    assert parse_obj_as(dict[int, int], inputs) == {1: 2}
 
 
 def test_schema():
-    assert schema_of(Union[int, str], title='IntOrStr') == {
+    assert schema_of(int | str, title='IntOrStr') == {
         'title': 'IntOrStr',
         'anyOf': [{'type': 'integer'}, {'type': 'string'}],
     }
-    assert schema_json_of(Union[int, str], title='IntOrStr', indent=2) == (
+    assert schema_json_of(int | str, title='IntOrStr', indent=2) == (
         '{\n'
         '  "anyOf": [\n'
         '    {\n'

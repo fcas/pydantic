@@ -1,9 +1,9 @@
 import re
 from datetime import date, datetime, time, timedelta, timezone
+from typing import Annotated
 
 import pytest
 from dirty_equals import HasRepr
-from typing_extensions import Annotated
 
 from pydantic import (
     AwareDatetime,
@@ -13,6 +13,8 @@ from pydantic import (
     NaiveDatetime,
     PastDate,
     PastDatetime,
+    PydanticUserError,
+    TypeAdapter,
     ValidationError,
     condate,
 )
@@ -87,7 +89,7 @@ def date_model_fixture():
         (float('inf'), Err('Input should be a valid date or datetime, dates after 9999')),
         (int('1' + '0' * 100), Err('Input should be a valid date or datetime, dates after 9999')),
         (1e1000, Err('Input should be a valid date or datetime, dates after 9999')),
-        (float('-infinity'), Err('Input should be a valid date or datetime, dates before 1600')),
+        (float('-infinity'), Err('Input should be a valid date or datetime, dates before 0000')),
         (float('nan'), Err('Input should be a valid date or datetime, NaN values not permitted')),
     ],
 )
@@ -174,8 +176,8 @@ def datetime_model_fixture():
         ('1494012444.883309', datetime(2017, 5, 5, 19, 27, 24, 883309, tzinfo=timezone.utc)),
         ('1494012444', datetime(2017, 5, 5, 19, 27, 24, tzinfo=timezone.utc)),
         (b'1494012444', datetime(2017, 5, 5, 19, 27, 24, tzinfo=timezone.utc)),
-        ('1494012444000.883309', datetime(2017, 5, 5, 19, 27, 24, 883301, tzinfo=timezone.utc)),
-        ('-1494012444000.883309', datetime(1922, 8, 29, 4, 32, 35, 999000, tzinfo=timezone.utc)),
+        ('1494012444000.883309', datetime(2017, 5, 5, 19, 27, 24, 883, tzinfo=timezone.utc)),
+        ('-1494012444000.883309', datetime(1922, 8, 29, 4, 32, 35, 999117, tzinfo=timezone.utc)),
         (19_999_999_999, datetime(2603, 10, 11, 11, 33, 19, tzinfo=timezone.utc)),  # just before watershed
         (20_000_000_001, datetime(1970, 8, 20, 11, 33, 20, 1000, tzinfo=timezone.utc)),  # just after watershed
         (1_549_316_052, datetime(2019, 2, 4, 21, 34, 12, 0, tzinfo=timezone.utc)),  # nowish in s
@@ -184,7 +186,7 @@ def datetime_model_fixture():
         (1_549_316_052_104_324, Err('Input should be a valid datetime, dates after 9999')),  # nowish in μs
         (1_549_316_052_104_324_096, Err('Input should be a valid datetime, dates after 9999')),  # nowish in ns
         (float('inf'), Err('Input should be a valid datetime, dates after 9999')),
-        (float('-inf'), Err('Input should be a valid datetime, dates before 1600')),
+        (float('-inf'), Err('Input should be a valid datetime, dates before 0000')),
         (1e50, Err('Input should be a valid datetime, dates after 9999')),
         (float('nan'), Err('Input should be a valid datetime, NaN values not permitted')),
     ],
@@ -195,6 +197,82 @@ def test_datetime_parsing(DatetimeModel, value, result):
             DatetimeModel(dt=value)
     else:
         assert DatetimeModel(dt=value).dt == result
+
+
+@pytest.mark.parametrize(
+    'val_temporal_unit, input_value, expected',
+    [
+        # 'seconds' mode: treat as seconds since epoch
+        ('seconds', 1654646400, datetime(2022, 6, 8, tzinfo=timezone.utc)),
+        ('seconds', '1654646400', datetime(2022, 6, 8, tzinfo=timezone.utc)),
+        ('seconds', 1654646400.123456, datetime(2022, 6, 8, 0, 0, 0, 123456, tzinfo=timezone.utc)),
+        ('seconds', 8640000000.0, datetime(2243, 10, 17, tzinfo=timezone.utc)),
+        ('seconds', 92534400000.0, datetime(4902, 4, 20, tzinfo=timezone.utc)),
+        # 'milliseconds' mode: treat as milliseconds since epoch
+        ('milliseconds', 1654646400, datetime(1970, 1, 20, 3, 37, 26, 400000, tzinfo=timezone.utc)),
+        ('milliseconds', 1654646400123, datetime(2022, 6, 8, 0, 0, 0, 123000, tzinfo=timezone.utc)),
+        ('milliseconds', '1654646400123', datetime(2022, 6, 8, 0, 0, 0, 123000, tzinfo=timezone.utc)),
+        ('milliseconds', 8640000000.0, datetime(1970, 4, 11, tzinfo=timezone.utc)),
+        ('milliseconds', 92534400000.0, datetime(1972, 12, 7, tzinfo=timezone.utc)),
+        (
+            'milliseconds',
+            1654646400123.456,
+            datetime(2022, 6, 8, 0, 0, 0, 123456, tzinfo=timezone.utc),
+        ),
+        # 'infer' mode: large numbers are ms, small are s
+        ('infer', 1654646400, datetime(2022, 6, 8, tzinfo=timezone.utc)),
+        ('infer', 1654646400123, datetime(2022, 6, 8, 0, 0, 0, 123000, tzinfo=timezone.utc)),
+        (
+            'infer',
+            1654646400123.456,
+            datetime(2022, 6, 8, 0, 0, 0, 123456, tzinfo=timezone.utc),
+        ),
+        ('infer', 8640000000.0, datetime(2243, 10, 17, tzinfo=timezone.utc)),
+        ('infer', 92534400000.0, datetime(1972, 12, 7, tzinfo=timezone.utc)),
+    ],
+)
+def test_val_temporal_unit_datetime(val_temporal_unit, input_value, expected):
+    class DatetimeModel(BaseModel):
+        dt: datetime
+
+        model_config = {
+            'val_temporal_unit': val_temporal_unit,
+        }
+
+    assert DatetimeModel(dt=input_value).dt == expected
+
+
+@pytest.mark.parametrize(
+    'val_temporal_unit, input_value, expected',
+    [
+        # 'seconds' mode: treat as seconds since epoch
+        ('seconds', 1654646400, date(2022, 6, 8)),
+        ('seconds', '1654646400', date(2022, 6, 8)),
+        ('seconds', 1654646400.0, date(2022, 6, 8)),
+        ('seconds', 8640000000.0, date(2243, 10, 17)),
+        ('seconds', 92534400000.0, date(4902, 4, 20)),
+        # 'milliseconds' mode: treat as milliseconds since epoch
+        ('milliseconds', 1654646400000, date(2022, 6, 8)),
+        ('milliseconds', '1654646400000', date(2022, 6, 8)),
+        ('milliseconds', 1654646400000.0, date(2022, 6, 8)),
+        ('milliseconds', 8640000000.0, date(1970, 4, 11)),
+        ('milliseconds', 92534400000.0, date(1972, 12, 7)),
+        # 'infer' mode: large numbers are ms, small are s
+        ('infer', 1654646400, date(2022, 6, 8)),
+        ('infer', 1654646400000, date(2022, 6, 8)),
+        ('infer', 8640000000.0, date(2243, 10, 17)),
+        ('infer', 92534400000.0, date(1972, 12, 7)),
+    ],
+)
+def test_val_temporal_unit_date(val_temporal_unit, input_value, expected):
+    class DateModel(BaseModel):
+        dt: date
+
+        model_config = {
+            'val_temporal_unit': val_temporal_unit,
+        }
+
+    assert DateModel(dt=input_value).dt == expected
 
 
 @pytest.mark.parametrize(
@@ -373,10 +451,10 @@ def test_parse_durations(TimedeltaModel, value, result):
 )
 def test_model_type_errors(field, value, error_message):
     class Model(BaseModel):
-        dt: datetime = None
-        d: date = None
-        t: time = None
-        td: timedelta = None
+        dt: datetime | None = None
+        d: date | None = None
+        t: time | None = None
+        td: timedelta | None = None
 
     with pytest.raises(ValidationError) as exc_info:
         Model(**{field: value})
@@ -385,13 +463,13 @@ def test_model_type_errors(field, value, error_message):
     assert error['msg'] == error_message
 
 
-@pytest.mark.parametrize('field', ['dt', 'd', 't', 'dt'])
+@pytest.mark.parametrize('field', ['dt', 'd', 't'])
 def test_unicode_decode_error(field):
     class Model(BaseModel):
-        dt: datetime = None
-        d: date = None
-        t: time = None
-        td: timedelta = None
+        dt: datetime | None = None
+        d: date | None = None
+        t: time | None = None
+        td: timedelta | None = None
 
     with pytest.raises(ValidationError) as exc_info:
         Model(**{field: b'\x81\x81\x81\x81\x81\x81\x81\x81'})
@@ -608,7 +686,7 @@ def test_future_datetime_validation_fails(value, future_datetime_type):
     ),
 )
 def test_invalid_annotated_type(annotation):
-    with pytest.raises(TypeError, match=f"'{annotation.__name__}' cannot annotate 'str'."):
+    with pytest.raises(PydanticUserError, match=f"'{annotation.__name__}' cannot annotate 'str'."):
 
         class Model(BaseModel):
             foo: Annotated[str, annotation()]
@@ -634,3 +712,100 @@ def test_datetime_from_date_str():
 
     m = Model(value='2015-10-21')
     assert m.value == datetime(2015, 10, 21, 0, 0)
+
+
+@pytest.mark.parametrize(
+    'dt,expected_to_json,mode',
+    [
+        (
+            datetime(2024, 1, 1, 0, 0, 0),
+            b'"2024-01-01T00:00:00"',
+            'iso8601',
+        ),
+        (
+            datetime(2024, 1, 1, 0, 0, 0),
+            b'1704067200.0',
+            'seconds',
+        ),
+        (
+            datetime(2024, 1, 1, 0, 0, 0),
+            b'1704067200000.0',
+            'milliseconds',
+        ),
+        (
+            datetime(2024, 1, 1, 1, 1, 1, 23),
+            b'1704070861.000023',
+            'seconds',
+        ),
+        (
+            datetime(2024, 1, 1, 1, 1, 1, 23),
+            b'1704070861000.023',
+            'milliseconds',
+        ),
+    ],
+)
+def test_config_datetime(dt: datetime, expected_to_json, mode):
+    ta = TypeAdapter(datetime, config={'ser_json_temporal': mode})
+
+    instance = ta.validate_python(dt)
+
+    assert instance == dt
+    assert ta.dump_json(instance) == expected_to_json
+
+
+@pytest.mark.parametrize(
+    'dt,expected_to_json,mode',
+    [
+        (
+            date(2024, 1, 1),
+            b'"2024-01-01"',
+            'iso8601',
+        ),
+        (
+            date(2024, 1, 1),
+            b'1704067200.0',
+            'seconds',
+        ),
+        (
+            date(2024, 1, 1),
+            b'1704067200000.0',
+            'milliseconds',
+        ),
+    ],
+)
+def test_config_date(dt: date, expected_to_json, mode):
+    ta = TypeAdapter(date, config={'ser_json_temporal': mode})
+
+    instance = ta.validate_python(dt)
+
+    assert instance == dt
+    assert ta.dump_json(instance) == expected_to_json
+
+
+@pytest.mark.parametrize(
+    't,expected_to_json,mode',
+    [
+        (
+            time(3, 14, 1, 59263),
+            b'"03:14:01.059263"',
+            'iso8601',
+        ),
+        (
+            time(3, 14, 1, 59263),
+            b'11641.059263',
+            'seconds',
+        ),
+        (
+            time(3, 14, 1, 59263),
+            b'11641059.263',
+            'milliseconds',
+        ),
+    ],
+)
+def test_config_time(t: date, expected_to_json, mode):
+    ta = TypeAdapter(time, config={'ser_json_temporal': mode})
+
+    instance = ta.validate_python(t)
+
+    assert instance == t
+    assert ta.dump_json(instance) == expected_to_json

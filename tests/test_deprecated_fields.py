@@ -1,8 +1,7 @@
-import importlib.metadata
+from typing import Annotated
 
 import pytest
-from packaging.version import Version
-from typing_extensions import Annotated, Self, deprecated
+from typing_extensions import Self, deprecated
 
 from pydantic import BaseModel, Field, computed_field, field_validator, model_validator
 
@@ -26,7 +25,8 @@ def test_deprecated_fields():
 
     instance = Model(a=1, b=1, c=1)
 
-    pytest.warns(DeprecationWarning, lambda: instance.a, match='^$')
+    with pytest.warns(DeprecationWarning, match='^$'):
+        instance.a
 
     with pytest.warns(DeprecationWarning, match='^This is deprecated$'):
         b = instance.b
@@ -34,10 +34,6 @@ def test_deprecated_fields():
     assert b == 1
 
 
-@pytest.mark.skipif(
-    Version(importlib.metadata.version('typing_extensions')) < Version('4.9'),
-    reason='`deprecated` type annotation requires typing_extensions>=4.9',
-)
 def test_deprecated_fields_deprecated_class():
     class Model(BaseModel):
         a: Annotated[int, deprecated('')]
@@ -57,9 +53,12 @@ def test_deprecated_fields_deprecated_class():
 
     instance = Model(a=1)
 
-    pytest.warns(DeprecationWarning, lambda: instance.a, match='^$')
-    pytest.warns(DeprecationWarning, lambda: instance.b, match='^This is deprecated$')
-    pytest.warns(DeprecationWarning, lambda: instance.c, match='^This is deprecated$')
+    with pytest.warns(DeprecationWarning, match='^$'):
+        instance.a
+    with pytest.warns(DeprecationWarning, match='^This is deprecated$'):
+        instance.b
+    with pytest.warns(DeprecationWarning, match='^This is deprecated$'):
+        instance.c
 
 
 def test_deprecated_fields_field_validator():
@@ -118,7 +117,7 @@ def test_computed_field_deprecated():
 
         @computed_field(deprecated='This is deprecated')
         @property
-        @deprecated('This is deprecated (this message is overridden)')
+        @deprecated('This is deprecated (this message is the one emitted)')
         def p2(self) -> int:
             return 1
 
@@ -152,10 +151,17 @@ def test_computed_field_deprecated():
 
     instance = Model()
 
-    pytest.warns(DeprecationWarning, lambda: instance.p1, match='^This is deprecated$')
-    pytest.warns(DeprecationWarning, lambda: instance.p2, match='^This is deprecated$')
-    pytest.warns(DeprecationWarning, lambda: instance.p4, match='^This is deprecated$')
-    pytest.warns(DeprecationWarning, lambda: instance.p5, match='^This is deprecated$')
+    with pytest.warns(DeprecationWarning, match='^This is deprecated$'):
+        instance.p1
+    # Ideally, the deprecation message from `@computed_field` should take priority,
+    # but we can't safely unwrap the decorated property from `@deprecated` (see note in
+    # `set_deprecated_descriptors()`):
+    with pytest.warns(DeprecationWarning, match=r'^This is deprecated \(this message is the one emitted\)$'):
+        instance.p2
+    with pytest.warns(DeprecationWarning, match='^This is deprecated$'):
+        instance.p4
+    with pytest.warns(DeprecationWarning, match='^This is deprecated$'):
+        instance.p5
 
     with pytest.warns(DeprecationWarning, match='^$'):
         p3 = instance.p3
@@ -163,10 +169,6 @@ def test_computed_field_deprecated():
     assert p3 == 1
 
 
-@pytest.mark.skipif(
-    Version(importlib.metadata.version('typing_extensions')) < Version('4.9'),
-    reason='`deprecated` type annotation requires typing_extensions>=4.9',
-)
 def test_computed_field_deprecated_deprecated_class():
     class Model(BaseModel):
         @computed_field(deprecated=deprecated('This is deprecated'))
@@ -174,11 +176,23 @@ def test_computed_field_deprecated_deprecated_class():
         def p1(self) -> int:
             return 1
 
+        @computed_field(deprecated=True)
+        @property
+        def p2(self) -> int:
+            return 2
+
+        @computed_field(deprecated='This is a deprecated string')
+        @property
+        def p3(self) -> int:
+            return 3
+
     assert Model.model_json_schema(mode='serialization') == {
         'properties': {
             'p1': {'deprecated': True, 'readOnly': True, 'title': 'P1', 'type': 'integer'},
+            'p2': {'deprecated': True, 'readOnly': True, 'title': 'P2', 'type': 'integer'},
+            'p3': {'deprecated': True, 'readOnly': True, 'title': 'P3', 'type': 'integer'},
         },
-        'required': ['p1'],
+        'required': ['p1', 'p2', 'p3'],
         'title': 'Model',
         'type': 'object',
     }
@@ -188,7 +202,15 @@ def test_computed_field_deprecated_deprecated_class():
     with pytest.warns(DeprecationWarning, match='^This is deprecated$'):
         p1 = instance.p1
 
+    with pytest.warns(DeprecationWarning, match='^deprecated$'):
+        p2 = instance.p2
+
+    with pytest.warns(DeprecationWarning, match='^This is a deprecated string$'):
+        p3 = instance.p3
+
     assert p1 == 1
+    assert p2 == 2
+    assert p3 == 3
 
 
 def test_deprecated_with_boolean() -> None:
@@ -208,4 +230,54 @@ def test_deprecated_with_boolean() -> None:
 
     instance = Model(a=1, b=1)
 
-    pytest.warns(DeprecationWarning, lambda: instance.a, match='deprecated')
+    with pytest.warns(DeprecationWarning, match='deprecated'):
+        instance.a
+
+
+def test_computed_field_deprecated_class_access() -> None:
+    class Model(BaseModel):
+        @computed_field(deprecated=True)
+        def prop(self) -> int:
+            return 1
+
+    assert isinstance(Model.prop, property)
+
+
+def test_computed_field_deprecated_subclass() -> None:
+    """https://github.com/pydantic/pydantic/issues/10384"""
+
+    class Base(BaseModel):
+        @computed_field(deprecated=True)
+        def prop(self) -> int:
+            return 1
+
+    class Sub(Base):
+        pass
+
+
+def test_deprecated_field_forward_annotation() -> None:
+    """https://github.com/pydantic/pydantic/issues/11390"""
+
+    class Model(BaseModel):
+        a: "Annotated[Test, deprecated('test')]" = 2
+
+    Test = int
+
+    Model.model_rebuild()
+    assert isinstance(Model.model_fields['a'].deprecated, deprecated)
+    assert Model.model_fields['a'].deprecated.message == 'test'
+
+    m = Model()
+
+    with pytest.warns(DeprecationWarning, match='test'):
+        m.a
+
+
+def test_deprecated_field_with_assignment() -> None:
+    class Model(BaseModel):
+        # A buggy implementation made it so that deprecated wouldn't
+        # appear on the `FieldInfo`:
+        a: Annotated[int, deprecated('test')] = Field(default=1)
+
+    assert isinstance(Model.model_fields['a'].deprecated, deprecated)
+    assert Model.model_fields['a'].deprecated.message == 'test'
